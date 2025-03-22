@@ -1,7 +1,10 @@
+import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from netCDF4 import Dataset
 
-
+import train_network as tn
 import data_generation
 import network_losses as nl
 
@@ -25,18 +28,18 @@ class FullNetInternals(nn.Module):
 
         # Learns optical depth for each layer for each constituent for 
         # each channel
-        self.extinction_net = LayerDistributed(Extinction(n_channel,dropout_p,
+        self.extinction_net = tn.LayerDistributed(tn.Extinction(n_channel,dropout_p,
                                                           device))
         
-        self.scattering_net = LayerDistributed(Scattering_v2_tau_efficient(n_channel,
+        self.scattering_net = tn.LayerDistributed(tn.Scattering_v2_tau_efficient(n_channel,
                                                     n_constituent,
                                                     dropout_p,
                                                     device))
 
-        self.multireflection_net = MultiReflection()
+        self.multireflection_net = tn.MultiReflection()
 
         # Propagates radiation from top of atmosphere (TOA) to surface
-        self.propagation_net = Propagation(n_channel)
+        self.propagation_net = tn.Propagation(n_channel)
 
     def reset_dropout(self,dropout_p):
         self.extinction_net.reset_dropout(dropout_p)
@@ -44,10 +47,7 @@ class FullNetInternals(nn.Module):
 
     def forward(self, x):
         x_layers, x_surface, _, _, _, = x
-        torch.cuda.synchronize()
-        t_0 = time.time()
-        #print(f"x_layers.shape = {x_layers.shape}")
-        #9 constituents: lwc, iwc, h2o, o3, co2,  o2, n2o, ch4, co,  -no2?, 
+ 
         (temperature_pressure, 
         constituents) = (x_layers[:,:,0:2], 
                         x_layers[:,:,2:10])
@@ -119,10 +119,6 @@ class FullNetInternals(nn.Module):
         (flux_down_direct, flux_down_diffuse, flux_up_diffuse, 
         flux_absorbed) = flux
         
-        torch.cuda.synchronize()
-        t_1 = time.time()
-        global t_total
-        t_total += t_1 - t_0
 
         internal_data = [x_layers[:,:,2], x_layers[:,:,3], x_layers[:,:,5], mu_diffuse_original, s_direct, s_diffuse, r_toa, x_surface[:,1],
                          mu_direct, t_direct_total, t_diffuse_total, x_layers[:,:,4]]
@@ -130,10 +126,7 @@ class FullNetInternals(nn.Module):
 
         return predicted_data, internal_data
 
-
-
 # computes an error metric for each layer
-
 
 def test_layers_loop(dataloader, model, loss_functions, loss_names, loss_weights, is_flux, device):
     """ Generic testing / evaluation loop """
@@ -331,7 +324,7 @@ def write_internal_data(internal_data, output_file_name):
 
 def evaluate_network():
 
-    if False:
+    if True:
         print("Pytorch version:", torch.__version__)
         device = "cpu"
         print(f"Using {device} device")
@@ -398,7 +391,7 @@ def evaluate_network():
     if is_use_internals:
         model = FullNetInternals(n_channel,n_constituent,dropout_p=0,device=device)
     else:
-        model = FullNet(n_channel,n_constituent,dropout_p=0,device=device)
+        model = tn.FullNet(n_channel,n_constituent,dropout_p=0,device=device)
 
     model = model.to(device=device)
     model_filename = model_dir + f"/Torch.SW.{model_id}" # 
@@ -419,7 +412,7 @@ def evaluate_network():
                                                       num_workers=1)
         print(f"Testing error, Year = {year}")
 
-        loss_weights = get_loss_weights(n_epoch)
+        loss_weights = tn.get_loss_weights(n_epoch)
 
         checkpoint = torch.load(model_filename + str(n_epoch).zfill(3), 
                                 map_location=torch.device(device))
@@ -428,18 +421,22 @@ def evaluate_network():
 
         if is_geographic_loss:
 
-            loss_geographic_heating_rate_rmse = loss_geographic_heating_rate_maker(geographic_rmse, number_of_sites)
-            loss_geographic_heating_rate_bias = loss_geographic_heating_rate_maker(geographic_bias, number_of_sites)
+            geographic_heating_rate_rmse = nl.geographic_heating_rate_maker(nl.geographic_rmse, number_of_sites)
+            geographic_heating_rate_bias = nl.geographic_heating_rate_maker(nl.geographic_bias, number_of_sites)
 
-            loss_geographic_down_flux_rmse = loss_geographic_flux_maker(geographic_rmse, number_of_sites, is_down=True)
-            loss_geographic_down_flux_bias = loss_geographic_flux_maker(geographic_bias, number_of_sites, is_down=True)
+            geographic_down_flux_rmse = nl.geographic_flux_maker(nl.geographic_rmse, number_of_sites, is_down=True)
+            geographic_down_flux_bias = nl.geographic_flux_maker(nl.geographic_bias, number_of_sites, is_down=True)
 
-            loss_geographic_up_flux_rmse = loss_geographic_flux_maker(geographic_rmse, number_of_sites, is_down=False)
-            loss_geographic_up_flux_bias = loss_geographic_flux_maker(geographic_bias, number_of_sites, is_down=False)
+            geographic_up_flux_rmse = nl.geographic_flux_maker(nl.geographic_rmse, number_of_sites, is_down=False)
+            geographic_up_flux_bias = nl.geographic_flux_maker(nl.geographic_bias, number_of_sites, is_down=False)
 
-            geographic_loss_functions = (loss_geographic_heating_rate_rmse,loss_geographic_heating_rate_bias,
-            loss_geographic_down_flux_rmse,loss_geographic_down_flux_bias,
-            loss_geographic_up_flux_rmse,loss_geographic_up_flux_bias)
+            geographic_loss_functions = (
+                geographic_heating_rate_rmse,
+                geographic_heating_rate_bias,
+                geographic_down_flux_rmse,
+                geographic_down_flux_bias,
+                geographic_up_flux_rmse,
+                geographic_up_flux_bias)
 
             geographic_loss_names = ("heating_rate_rmse","heating_rate_bias", "downwelling_flux_rmse","downwelling_flux_bias","upwelling_flux_rmse","upwelling_flux_bias")
             loss = test_geographic_loop(
@@ -470,10 +467,10 @@ def evaluate_network():
                 layered_loss_names, loss_weights, is_flux, device)
         else:
 
-            loss_flux_0_0025 = nl.mu_selector_flux_maker(0.0025)
-            loss_flux_0_01 = nl.mu_selector_flux_maker(0.01)
-            loss_flux_0_05 = nl.mu_selector_flux_maker(0.05)
-            loss_flux_0_10 = nl.mu_selector_flux_maker(0.10)
+            loss_flux_0_0025 = nl.mu_selector_flux_maker(0.0025, nl.total_rmse)
+            loss_flux_0_01 = nl.mu_selector_flux_maker(0.01, nl.total_rmse)
+            loss_flux_0_05 = nl.mu_selector_flux_maker(0.05, nl.total_rmse)
+            loss_flux_0_10 = nl.mu_selector_flux_maker(0.10, nl.total_rmse)
 
             # Standard loss functions
             loss_functions = (
@@ -492,7 +489,7 @@ def evaluate_network():
             loss_names = (
                 "Openbox RMSE", 
                 "Flux RMSE", "Direct Flux RMSE","Diffuse Flux RMSE",
-                "Flux Bias", "Flux Down", "Flux up", 
+                "Flux Bias", "Flux Down RMSE", "Flux up RMSE", 
                 "Flux Down Bias", "Flux up Bias ", 
                 "Heating Rate RMSE", "Direct Extinction RMSE", 
                 "Diffuse Heating Rate RMSE", 
@@ -509,7 +506,7 @@ def evaluate_network():
                     f"internal_output.sc_{model_id}_{n_epoch}.{year}.nc")
                 
             elif not is_layered_loss and not is_geographic_loss:
-                loss = train_network.test_loop (test_dataloader, model, 
+                loss = tn.test_loop (test_dataloader, model, 
                                                 loss_functions, 
                                                 loss_names, 
                                                 loss_weights, device)
@@ -517,7 +514,6 @@ def evaluate_network():
     
 
 if __name__ == "__main__":
-    
 
     evaluate_network()
 

@@ -91,7 +91,7 @@ def heating_rate(flux_down_true, flux_up_true, flux_down_pred, flux_up_pred,
 def geographic_heating_rate(flux_down_true, flux_up_true, 
                             flux_down_pred, flux_up_pred, 
                             delta_pressure, sites, number_of_sites, 
-                            loss_metric_function):
+                            metric_function):
         
     flux_absorbed_true = (flux_down_true[:,:-1] - flux_down_true[:,1:] + 
                           flux_up_true[:,1:] - flux_up_true[:,:-1])
@@ -105,7 +105,7 @@ def geographic_heating_rate(flux_down_true, flux_up_true,
     heat_pred = data_generation.absorbed_flux_to_heating_rate(
         flux_absorbed_pred, delta_pressure)
 
-    loss, count = loss_metric_function(heat_true, heat_pred, sites, number_of_sites)
+    loss, count = metric_function(heat_true, heat_pred, sites, number_of_sites)
 
     return loss, count
 
@@ -120,7 +120,7 @@ def direct_extinction_maker(metric_function):
         return loss
     return direct_extinction_wrapper
 
-def loss_geographic_heating_rate_maker(loss_metric_function, number_of_sites):
+def loss_geographic_heating_rate_maker(metric_function, number_of_sites):
     def loss_geographic_heating_rate_wrapper(data, y_pred, loss_weights):
         _, _, delta_pressure, y_true, sites = data
         (flux_down_direct_pred, flux_down_diffuse_pred, flux_up_diffuse_pred, _) = y_pred
@@ -135,7 +135,7 @@ def loss_geographic_heating_rate_maker(loss_metric_function, number_of_sites):
         flux_down_pred = flux_down_direct_pred + flux_down_diffuse_pred
         flux_up_pred = flux_up_diffuse_pred
 
-        hr_loss, hr_count = loss_geographic_heating_rate(flux_down_true, flux_up_true, flux_down_pred, flux_up_pred, delta_pressure, sites, number_of_sites, loss_metric_function)
+        hr_loss, hr_count = geographic_heating_rate(flux_down_true, flux_up_true, flux_down_pred, flux_up_pred, delta_pressure, sites, number_of_sites, metric_function)
         
         return hr_loss, hr_count
     return loss_geographic_heating_rate_wrapper
@@ -204,6 +204,8 @@ def geographic_flux_maker(metric_function, number_of_sites, is_down):
     return geographic_flux_wrapper
 
 
+
+
 def loss_flux(flux_down_true, flux_up_true, 
               flux_down_pred, flux_up_pred, 
               metric_function):  
@@ -256,6 +258,7 @@ def flux_maker (metric_function):
                          flux_down_pred, flux_up_pred, 
                          metric_function)
         return loss
+    return flux_wrapper
 
 def directional_flux_maker(metric_function, is_down):
     def flux_wrapper(data, y_pred, loss_weights):
