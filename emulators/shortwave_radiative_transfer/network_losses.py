@@ -120,8 +120,8 @@ def direct_extinction_maker(metric_function):
         return loss
     return direct_extinction_wrapper
 
-def loss_geographic_heating_rate_maker(metric_function, number_of_sites):
-    def loss_geographic_heating_rate_wrapper(data, y_pred, loss_weights):
+def geographic_heating_rate_maker(metric_function, number_of_sites):
+    def geographic_heating_rate_wrapper(data, y_pred, loss_weights):
         _, _, delta_pressure, y_true, sites = data
         (flux_down_direct_pred, flux_down_diffuse_pred, flux_up_diffuse_pred, _) = y_pred
         #(flux_down_direct_true, flux_down_diffuse_true, flux_up_diffuse_true, _, _, _) = y_true
@@ -138,7 +138,7 @@ def loss_geographic_heating_rate_maker(metric_function, number_of_sites):
         hr_loss, hr_count = geographic_heating_rate(flux_down_true, flux_up_true, flux_down_pred, flux_up_pred, delta_pressure, sites, number_of_sites, metric_function)
         
         return hr_loss, hr_count
-    return loss_geographic_heating_rate_wrapper
+    return geographic_heating_rate_wrapper
 
 def heating_rate_maker(metric_function):
     def heating_rate_wrapper(data, y_pred, loss_weights):

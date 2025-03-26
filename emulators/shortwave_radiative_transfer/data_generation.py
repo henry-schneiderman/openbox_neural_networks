@@ -118,9 +118,7 @@ def load_data(file, file_index, is_clear_sky):
     constituents = constituents / constituents_norm
 
 
-    x_layers = np.concatenate((temperature_pressure, constituents), axis=2)
     shape = flux_down_direct.shape
-
     flux_down_direct = flux_down_direct.reshape((shape[0], shape[1], 1))
     flux_down_diffuse = flux_down_diffuse.reshape((shape[0], shape[1], 1))
     flux_up_diffuse = flux_up_diffuse.reshape((shape[0], shape[1], 1))
@@ -143,6 +141,9 @@ def load_data(file, file_index, is_clear_sky):
     else:
         y = np.concatenate((flux_down_direct, flux_down_diffuse, flux_up_diffuse, flux_down_direct_clear, flux_down_diffuse_clear, flux_up_diffuse_clear), axis=2)
         y = y[selection,:,:]
+        
+    x_layers = np.concatenate((temperature_pressure, constituents), axis=2)
+
 
     mu = mu.reshape((-1,1))
     surface_albedo = surface_albedo.reshape((-1,1))
@@ -202,7 +203,6 @@ class RTDataSet(Dataset):
             self.n_data.append(c)
 
         self.i_file = 0
-        print(f"Number of valid examples = {self.n_data_accumulated[-1]}")
         print(f"Number of valid examples = {acc}", flush=True)
 
     def __len__(self):
