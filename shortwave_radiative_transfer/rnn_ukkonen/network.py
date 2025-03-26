@@ -328,18 +328,18 @@ if True:
     # steps_per_epoch = 924
 
     train_input_dir = "/data-T1/hws/CAMS/processed_data/training/2008/"
-    cross_input_dir = "/data-T1/hws/CAMS/processed_data/cross_validation/2008/"
+    validation_input_dir = "/data-T1/hws/CAMS/processed_data/cross_validation/2008/"
     months = [str(m).zfill(2) for m in range(1, 13)]
     train_input_files = [
         f'{train_input_dir}Flux_Ukkonen-2008-{month}.nc' for month in months]
-    cross_input_files = [
-        f'{cross_input_dir}Flux_Ukkonen-2008-{month}.nc' for month in months]
+    validation_input_files = [
+        f'{validation_input_dir}Flux_Ukkonen-2008-{month}.nc' for month in months]
 
     generator_training = data_generation.InputSequence(
         train_input_files, batch_size)
     # generator_training = generator_training.batch(batch_size)
-    generator_cross_validation = data_generation.InputSequence(
-        cross_input_files, batch_size)
+    generator_validation = data_generation.InputSequence(
+        validation_input_files, batch_size)
 
     # generator_cross_validation = generator_cross_validation.batch(batch_size)
 
@@ -354,7 +354,7 @@ if True:
             history = model.fit(generator_training,
                                 epochs=epoch_period,
                                 shuffle=False, verbose=1,
-                                validation_data=generator_cross_validation, callbacks=callbacks)
+                                validation_data=generator_validation, callbacks=callbacks)
 
             # history = model.fit_generator(generator_training, \
             # steps_per_epoch, epochs=epoch_period,   \

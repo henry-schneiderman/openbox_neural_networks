@@ -1148,7 +1148,7 @@ def train_network():
     train_input_files = [
         f'{train_input_dir}shortwave-training-2008-{month}.nc' for month in months]
     validation_input_files = [
-        f'{validation_input_dir}shortwave_validation-2008-{month}.nc' for month in months]
+        f'{validation_input_dir}shortwave-validation-2008-{month}.nc' for month in months]
 
     ##################################
     # DO NOT CHANGE. Assumed by OpticalDepth
