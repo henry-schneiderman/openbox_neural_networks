@@ -1,4 +1,7 @@
 # openbox_neural_networks
+
+Author - Henry Schneiderman, henry@pittdata.com
+
 "Open box" neural networks for radiative transfer. Currently contains shortwave version only.
 
 See forthcoming paper for more details:
