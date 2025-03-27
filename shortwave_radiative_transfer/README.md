@@ -1,4 +1,4 @@
-**Open box neural network for shortwave radiative transfer**
+Open box neural network for shortwave radiative transfer
 
 Author - Henry Schneiderman, henry@pittdata.com
 
