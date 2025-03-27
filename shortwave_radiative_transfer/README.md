@@ -3,6 +3,8 @@
 Author - Henry Schneiderman, henry@pittdata.com<br>
 Please contact me if you have any questions or feedback
 
+H. Schneiderman. "An Open Box Physics-Based Neural Network for Modeling Shortwave Radiative Transfer" submitted to Artificial Intelligence for the Earth Systems (AIES) 
+
 Implemented using PyTorch.
 
 Conda environment setup (installs all Python packages needed by the software in this directory):<br> 
