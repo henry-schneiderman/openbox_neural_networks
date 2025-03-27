@@ -14,3 +14,7 @@ data_generation.py - Fetches and preprocesses data for training and testing
 
 network_losses.py - Loss functions for training and testing (e.g., loss per atmospheric layer, clear sky, geographic location)
 
+models/ - Trained models
+
+rnn_ukkonen/ - Peter Ukknonen's RNN for shortwave radiative transfer
+
