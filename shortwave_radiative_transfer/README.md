@@ -1,6 +1,7 @@
 Open box neural network for shortwave radiative transfer
 
 Author - Henry Schneiderman, henry@pittdata.com
+
 Please contact me if you have any questions or feedback
 
 Implemented using PyTorch.
