@@ -7,4 +7,3 @@ Author - Henry Schneiderman, henry@pittdata.com
 See forthcoming paper for more details:
 H. Schneiderman. "An Open Box Physics-Based Neural Network for Modeling Shortwave Radiative Transfer." Submitted to Artificial Intelligence for Earth Systems.
 
-Training and Testing datasets available at https://zenodo.org/records/15089913
