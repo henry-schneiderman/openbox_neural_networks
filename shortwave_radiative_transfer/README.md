@@ -12,7 +12,7 @@ evaluate_network.py - Test and analyze accuracy of a trained network
 
 data_generation.py - Called by train and evaluate to fetch and preprocesses data
 
-network_losses.py - Loss functions for training and testing (e.g., atmospheric layer, clear sky, geographic location)
+network_losses.py - Loss functions for training and evaluation (e.g., loss as a function of atmospheric layer, geographic location, cosine of solar zenith angle, clear sky vs. full sky)
 
 models/ - Trained models
 
