@@ -1,13 +1,12 @@
-#Open box neural network for shortwave radiative transfer
+<h1>Open box neural network for shortwave radiative transfer</h1>
 
-Author - Henry Schneiderman, henry@pittdata.com
-
+Author - Henry Schneiderman, henry@pittdata.com<br>
 Please contact me if you have any questions or feedback
 
 Implemented using PyTorch.
 
 Conda environment setup (installs all Python packages needed by the software in this directory):<br> 
-conda create -n myenv –file package_list.txt
+>>conda create -n myenv –file package_list.txt
 
 train_network.py - Train neural network<br>
 evaluate_network.py - Test and analyze accuracy of a trained network<br>
