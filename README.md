@@ -2,6 +2,6 @@
 
 Author - Henry Schneiderman, henry@pittdata.com
 
-"Open box" neural networks. Currently only contains shortwave radiative transfer version.
+"Open box" neural networks. Currently contains network for shortwave radiative transfer.
 
 
