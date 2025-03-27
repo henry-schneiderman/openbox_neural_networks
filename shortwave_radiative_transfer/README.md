@@ -1,7 +1,7 @@
 <h1>Open box neural network for shortwave radiative transfer</h1>
 
 Author - Henry Schneiderman, henry@pittdata.com<br>
-Please contact me if you have any questions or feedback
+Please contact me for any questions or feedback
 
 H. Schneiderman. "An Open Box Physics-Based Neural Network for Modeling Shortwave Radiative Transfer" submitted to Artificial Intelligence for the Earth Systems (AIES) 
 
