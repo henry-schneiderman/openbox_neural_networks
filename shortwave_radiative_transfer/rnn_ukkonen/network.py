@@ -133,10 +133,79 @@ use_gpu = True
 
 # model_name = 'Ukkonen/MODEL.RNN_1_ecRad_Dataset.'
 # model_name = 'Ukkonen/MODEL.RNN_2_ecRad_Dataset.'
-model_name = 'Ukkonen/MODEL.RNN_2_ecRad_Dataset.'
-is_train = False  # True
+training_model_name = 'models/rnn.v2.'
+evaluation_model_name = 'models/rnn.'
+is_train = True #False  # True
 
-weight_prof = data_generation.get_weight_profile(fpath)
+#weight_prof_1 = data_generation.get_weight_profile(fpath)
+#print(f'shape of weight profile {weight_prof_1.shape}')
+#print(f'weight_profile = {weight_prof_1}')
+
+if True:
+    weight_prof = np.array([[ 1.0,         2.5419967],
+                        [ 1.0001812  , 2.5423949],
+                        [ 1.0005001  , 2.5427516],
+                        [ 1.0009831  , 2.5431285],
+                        [ 1.0017012  , 2.5435448],
+                        [ 1.0027397  , 2.54398  ],
+                        [ 1.004103   , 2.5444002],
+                        [ 1.005808   , 2.5447874],
+                        [ 1.0074853  , 2.5451324],
+                        [ 1.0098314  , 2.545418 ],
+                        [ 1.0133003  , 2.5456414],
+                        [ 1.0149127  , 2.5457938],
+                        [ 1.016727   , 2.5458374],
+                        [ 1.0190794  , 2.5457652],
+                        [ 1.0214754  , 2.5455785],
+                        [ 1.0244205  , 2.5452962],
+                        [ 1.0280783  , 2.5449915],
+                        [ 1.0310009  , 2.5447795],
+                        [ 1.033982   , 2.544909 ],
+                        [ 1.037012   , 2.5456038],
+                        [ 1.040134   , 2.5471582],
+                        [ 1.0437244  , 2.5496995],
+                        [ 1.0470997  , 2.5532656],
+                        [ 1.0498221  , 2.5579112],
+                        [ 1.0523707  , 2.5638719],
+                        [ 1.0550792  , 2.571749 ],
+                        [ 1.058282   , 2.5825958],
+                        [ 1.0623422  , 2.597505 ],
+                        [ 1.0676103  , 2.617394 ],
+                        [ 1.0746381  , 2.6432145],
+                        [ 1.0838649  , 2.675958 ],
+                        [ 1.0953643  , 2.7149792],
+                        [ 1.1083289  , 2.758064 ],
+                        [ 1.1223836  , 2.8030307],
+                        [ 1.1372775  , 2.848576 ],
+                        [ 1.1529655  , 2.893857 ],
+                        [ 1.1695075  , 2.9391644],
+                        [ 1.1875534  , 2.9879549],
+                        [ 1.2087643  , 3.0503156],
+                        [ 1.235187   , 3.1392288],
+                        [ 1.2663157  , 3.2547712],
+                        [ 1.2998307  , 3.385529 ],
+                        [ 1.3317308  , 3.506738 ],
+                        [ 1.3638818  , 3.6296408],
+                        [ 1.3992813  , 3.7747912],
+                        [ 1.4406325  , 3.9637785],
+                        [ 1.4893966  , 4.214814 ],
+                        [ 1.5469016  , 4.550651 ],
+                        [ 1.6211523  , 5.064669 ],
+                        [ 1.7115484  , 5.8241506],
+                        [ 1.8044264  , 6.780392 ],
+                        [ 1.8850249  , 7.7789836],
+                        [ 1.9490186  , 8.700374 ],
+                        [ 1.9941084  , 9.401596 ],
+                        [ 2.023349   , 9.8528385],
+                        [ 2.042419  , 10.1270075],
+                        [ 2.054471  , 10.279838 ],
+                        [ 2.0623703 , 10.365189 ],
+                        [ 2.0676546 , 10.416825 ],
+                        [ 2.0717437 , 10.461722 ],
+                        [ 2.0737932 , 10.480462 ]])
+
+    
+#print(f'Difference {weight_prof - weight_prof_1}')
 
 mymetrics = ['mean_absolute_error']
 valfunc = 'val_mean_absolute_error'
@@ -236,6 +305,9 @@ if True:
     activ_last = 'sigmoid'
     # activ_last   = 'linear'
 
+    epoch_period = 2000
+    n_epochs = 0  # 565 #0 # start epoch
+    # steps_per_epoch = 924
     epochs = 100000
     patience = 50  # 400 #25
     lossfunc = losses.mean_squared_error
@@ -323,10 +395,6 @@ if True:
     callbacks = [EarlyStopping(monitor='val_loss',  patience=patience, verbose=1,
                                mode='min', restore_best_weights=True)]
 
-    epoch_period = 2000
-    n_epochs = 0  # 565 #0
-    # steps_per_epoch = 924
-
     train_input_dir = "/data-T1/hws/CAMS/processed_data/training/2008/"
     validation_input_dir = "/data-T1/hws/CAMS/processed_data/cross_validation/2008/"
     months = [str(m).zfill(2) for m in range(1, 13)]
@@ -346,7 +414,7 @@ if True:
     if n_epochs > 0:
         del model
         model = tf.keras.models.load_model(
-            datadir + model_name + str(n_epochs))
+            datadir + training_model_name + str(n_epochs))
 
     if is_train:
         while n_epochs < epochs:
@@ -366,18 +434,18 @@ if True:
 
             nn_epochs = len(history.history['rmse_hr'])
             if nn_epochs < epoch_period:
-                model.save(datadir + model_name + str(n_epochs + nn_epochs))
+                model.save(datadir + training_model_name + str(n_epochs + nn_epochs))
                 print("Writing FINAL model. N_epochs = " +
                       str(n_epochs + nn_epochs))
                 break
             else:
                 n_epochs = n_epochs + epoch_period
-                model.save(datadir + model_name + str(n_epochs))
+                model.save(datadir + training_model_name + str(n_epochs))
                 print(f"Writing model (n_epochs = {n_epochs})")
 
         del model
         model = tf.keras.models.load_model(
-            datadir + model_name + str(n_epochs))
+            datadir + training_model_name + str(n_epochs))
 
     else:
         start_time = 0
@@ -411,7 +479,7 @@ if True:
 
             print(f"n_epoch = {n_epoch}")
             model = tf.keras.models.load_model(
-                datadir + model_name + str(n_epoch))
+                datadir + evaluation_model_name + str(n_epoch))
             # model.add_metric(bias_hr(target,outputs,dpres,incflux),'bias_hr')
             # model.compile(optimizer=optim,loss='mse',metrics=[bias_hr,bias_flux])
 

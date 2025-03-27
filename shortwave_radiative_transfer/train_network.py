@@ -1,3 +1,11 @@
+"""
+Build and Train Open Box Neural Network for Shortwave Radiative Transfer
+
+train_network() - Trains neural network
+
+Author: Henry Schneiderman, henry@pittdata.com
+"""
+
 from netCDF4 import Dataset
 import numpy as np
 import time
@@ -1082,7 +1090,7 @@ def get_loss_weights(n):
     elif n <= 360:
         loss_weights = [1.0, 1.0, 1.0, 1.0]
     elif n <= 515:
-        loss_weights = [1.0, 1.0, 1.0, 1.0]
+        loss_weights = [1.0, 1.0, 2.0, 2.0]
     elif n <= 600:
         loss_weights = [1.0, 1.0, 0.5, 0.5]
     else:
@@ -1101,6 +1109,15 @@ def get_dropout(n, n_epochs):
 
 
 def train_network():
+    
+    """
+    train_network()
+    
+    High level script for training neural network
+    
+    Can train network from scatch: t_start = 0
+    Or resume training from a specified epoch: t_start = [epoch]
+    """
 
     print("Pytorch version:", torch.__version__)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1123,16 +1140,17 @@ def train_network():
 
     n_initial_models = 4
     # Set epoch at which to start training. May continue from any
-    # epoch for which model exists. Otherwise, set to zero
-    n_start = 275 #1  # 0
+    # epoch for which model exists. Otherwise, set to zero to start 
+    # from scratch
+    n_start = 360 #275 #1  # 0
     # If n_start == 1, then n_best must be set to index
     # of best initial model
     n_best = 3  # -1
 
     model_id = "v2.2."
 
+    ############################
     batch_size = 1024
-
     n_epochs = 2000
     n_windup = 200
     n_stop_training = 50

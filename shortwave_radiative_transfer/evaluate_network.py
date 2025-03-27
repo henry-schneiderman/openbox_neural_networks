@@ -1,3 +1,16 @@
+"""
+Test and Evaluate an Open Box Neural Network for Shortwave Radiative Transfer
+
+evaluate_network() - Evaluates neural network on testing datasets
+                    - generates various error metrics: bias, rmse
+                    - Can breakdown error by atmospheric layer,
+                    geography, cosine zenith angle, clear sky vs
+                    full sky.
+                    - can write internal data to file for further analysis
+
+Author: Henry Schneiderman, henry@pittdata.com
+"""
+
 import numpy as np
 import torch
 from torch import nn
