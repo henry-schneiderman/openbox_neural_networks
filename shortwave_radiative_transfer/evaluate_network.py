@@ -369,7 +369,7 @@ def evaluate_network():
         else:
             use_cuda = False
 
-    model_dir = "/home/hws/src/openbox_neural_networks/emulators/shortwave_radiative_transfer/models/"
+    model_dir = "/home/hws/src/openbox_neural_networks/shortwave_radiative_transfer/models/"
     model_id = "v2."
     name_prefix = 'openbox.shortwave.'
     n_epoch = 596  # Selected epoch
@@ -402,7 +402,7 @@ def evaluate_network():
     is_down = False  # only matters when is_layered_loss = True or is_geographic_loss
 
     # Computes losses for clear sky data
-    is_clear_sky = True
+    is_clear_sky = False
 
     # Select dataset
     if True:
@@ -556,41 +556,7 @@ def evaluate_network():
                                  loss_weights, device)
 
 
-def update_state_dict():
-    model_dir = "/data-T1/hws/models/"
-    old_model_id = "v2.1."
-    n_epoch = 90 #596
-    new_model_id = "v2.2."
-    n_channel = 42
-    n_constituent = 8
-    old_model_filename = model_dir + \
-        f"/Torch.SW.{old_model_id}" + str(n_epoch).zfill(3)
-    new_model_filename = model_dir + \
-        f"/Torch.SW.{new_model_id}" + str(n_epoch).zfill(3)
-
-    state_dict = torch.load(old_model_filename)
-    model_state_dict = state_dict['model_state_dict']
-
-    # Create a new dictionary to store the modified state_dict
-    new_model_state_dict = {}
-
-    # Iterate through the original state_dict and modify keys as needed
-    for key, value in model_state_dict.items():
-
-        new_key = key.replace('extinction_net.module.',
-                              'optical_depth_net.module.')
-
-        new_model_state_dict[new_key] = value
-
-    torch.save({
-        'epoch': n_epoch,
-        'model_state_dict': new_model_state_dict,
-        'optimizer_state_dict': state_dict['optimizer_state_dict'],
-        'loss': state_dict['loss']
-    },
-        new_model_filename)
-
 
 if __name__ == "__main__":
-    update_state_dict()
-    #evaluate_network()
+
+    evaluate_network()

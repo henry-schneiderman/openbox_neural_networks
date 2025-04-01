@@ -1142,7 +1142,7 @@ def train_network():
     # Set epoch at which to start training. May continue from any
     # epoch for which model exists. Otherwise, set to zero to start 
     # from scratch
-    n_start = 360 #275 #1  # 0
+    n_start = 0
     # If n_start == 1, then n_best must be set to index
     # of best initial model
     n_best = 3  # -1
