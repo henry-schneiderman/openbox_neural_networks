@@ -1,7 +1,7 @@
 """
 Modified by Henry Schneiderman
-- Added code to properly reverse output from intermediate RNN
-- Added functionality to work with Dataset allowing a list of input
+- Added code to properly reverse output from intermediate RNN module
+- Added functionality to input  Dataset data-type allowing a list of input
 files
 
 Python framework for developing neural networks to replace radiative
@@ -120,8 +120,7 @@ def plot_flux_and_hr_error(rsu_true, rsd_true, rsu_pred, rsd_pred, pres):
 #  ----------------- File paths -----------------
 
 
-datadir = "/data-T1/hws/models/"
-fpath = datadir + "/RADSCHEME_data_g224_CAMS_2009-2018_sans_2014-2015.2.nc"
+datadir = "/home/hws/src/openbox_neural_networks/shortwave_radiative_transfer/rnn_ukkonen/models/"
 
 # ----------- config ------------
 
@@ -133,13 +132,13 @@ use_gpu = True
 
 # model_name = 'Ukkonen/MODEL.RNN_1_ecRad_Dataset.'
 # model_name = 'Ukkonen/MODEL.RNN_2_ecRad_Dataset.'
-training_model_name = 'models/rnn.v2.'
-evaluation_model_name = 'models/rnn.'
-is_train = True #False  # True
+training_model_name = 'rnn.v3.'
+evaluation_model_name = 'rnn.v2.'
+is_train = False  # True
 
-#weight_prof_1 = data_generation.get_weight_profile(fpath)
-#print(f'shape of weight profile {weight_prof_1.shape}')
-#print(f'weight_profile = {weight_prof_1}')
+# Best epoch was 936 but writes out model at epoch 986
+# when training terminated
+n_epoch_best = 986 #565
 
 if True:
     weight_prof = np.array([[ 1.0,         2.5419967],
@@ -396,27 +395,25 @@ if True:
                                mode='min', restore_best_weights=True)]
 
     train_input_dir = "/data-T1/hws/CAMS/processed_data/training/2008/"
-    validation_input_dir = "/data-T1/hws/CAMS/processed_data/cross_validation/2008/"
+    validation_input_dir = "/data-T1/hws/CAMS/processed_data/validation/2008/"
     months = [str(m).zfill(2) for m in range(1, 13)]
     train_input_files = [
-        f'{train_input_dir}Flux_Ukkonen-2008-{month}.nc' for month in months]
+        f'{train_input_dir}shortwave-training-rnn-format-2008-{month}.nc' for month in months]
     validation_input_files = [
-        f'{validation_input_dir}Flux_Ukkonen-2008-{month}.nc' for month in months]
-
-    generator_training = data_generation.InputSequence(
-        train_input_files, batch_size)
-    # generator_training = generator_training.batch(batch_size)
-    generator_validation = data_generation.InputSequence(
-        validation_input_files, batch_size)
-
-    # generator_cross_validation = generator_cross_validation.batch(batch_size)
-
-    if n_epochs > 0:
-        del model
-        model = tf.keras.models.load_model(
-            datadir + training_model_name + str(n_epochs))
+        f'{validation_input_dir}shortwave-validation-rnn-format-2008-{month}.nc' for month in months]
 
     if is_train:
+        
+        if n_epochs > 0:
+            del model
+            model = tf.keras.models.load_model(
+                datadir + training_model_name + str(n_epochs))
+        
+        generator_training = data_generation.InputSequence(
+            train_input_files, batch_size)
+
+        generator_validation = data_generation.InputSequence(
+            validation_input_files, batch_size)
         while n_epochs < epochs:
 
             history = model.fit(generator_training,
@@ -424,12 +421,6 @@ if True:
                                 shuffle=False, verbose=1,
                                 validation_data=generator_validation, callbacks=callbacks)
 
-            # history = model.fit_generator(generator_training, \
-            # steps_per_epoch, epochs=epoch_period,   \
-            # validation_data=generator_cross_validation, #callbacks=callbacks)
-
-            # print(history.history.keys())
-            # print("number of epochs = " + str(history.history['epoch']))
             print(str(history.history['rmse_hr']))
 
             nn_epochs = len(history.history['rmse_hr'])
@@ -442,10 +433,6 @@ if True:
                 n_epochs = n_epochs + epoch_period
                 model.save(datadir + training_model_name + str(n_epochs))
                 print(f"Writing model (n_epochs = {n_epochs})")
-
-        del model
-        model = tf.keras.models.load_model(
-            datadir + training_model_name + str(n_epochs))
 
     else:
         start_time = 0
@@ -469,17 +456,14 @@ if True:
             print(f'Year = {year}')
             testing_input_dir = f"/data-T1/hws/CAMS/processed_data/testing/{year}/"
             testing_input_files = [
-                f'{testing_input_dir}Flux_Ukkonen-{year}-{month}.nc' for month in months]
-            # Best epoch was 515 but writes out model at epoch 565
-            # when training terminated
-            n_epoch = 565
+                f'{testing_input_dir}shortwave-testing-rnn-format-{year}-{month}.nc' for month in months]
 
             generator_testing = data_generation.InputSequence(
                 testing_input_files, batch_size)
 
-            print(f"n_epoch = {n_epoch}")
+            print(f"Best n_epoch = {n_epoch_best}")
             model = tf.keras.models.load_model(
-                datadir + evaluation_model_name + str(n_epoch))
+                datadir + evaluation_model_name + str(n_epoch_best))
             # model.add_metric(bias_hr(target,outputs,dpres,incflux),'bias_hr')
             # model.compile(optimizer=optim,loss='mse',metrics=[bias_hr,bias_flux])
 

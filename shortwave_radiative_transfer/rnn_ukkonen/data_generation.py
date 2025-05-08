@@ -60,8 +60,8 @@ def load_radscheme_rnn(fname, predictand='rsu_rsd', scale_p_h2o_o3=True, \
         x_gas[:,:,:,3] = x_gas[:,:,:,3]**(1.0/4)
     
     # plus surface albedo, which !!!FOR THIS DATA!!! is spectrally constant
-    sfc_alb = dat.variables['sfc_alb'][:].data # (nexp,ncol,ngpt)
-    sfc_alb = sfc_alb[:,:,0] # (nexp,ncol)
+    sfc_alb = dat.variables['sfc_alb'][:].data # (nexp,ncol)
+
     # plus by cosine of solar angle..
     mu0 = dat.variables['mu0'][:].data           # (nexp,ncol)
     # # ..multiplied by incoming flux
@@ -118,18 +118,18 @@ def load_radscheme_rnn(fname, predictand='rsu_rsd', scale_p_h2o_o3=True, \
 
     #print( "there are {} profiles in this dataset ({} experiments, {} columns)".format(nexp*ncol,nexp,ncol))
     
-    pres = dat.variables['pres_level'][:,:,:].data       # (nexp,ncol, nlev)
-    pres = np.reshape(pres,(ns,nlev))
+    dp = dat.variables['delta_pressure'][:,:,:].data       # (nexp,ncol, nlev)
+    dp = np.reshape(dp,(ns,nlay))
     
     if return_coldry:
-        coldry = get_col_dry(vmr_h2o,pres)
+        coldry = get_col_dry(vmr_h2o,dp)
     
     dat.close()
     if return_p:
         if return_coldry:
-            return x,y,rsd0,rsu0,rsd_raw,rsu_raw,pres,coldry
+            return x,y,rsd0,rsu0,rsd_raw,rsu_raw,dp,coldry
         else:
-            return x,y,rsd0,rsu0,rsd_raw,rsu_raw,pres
+            return x,y,rsd0,rsu0,rsd_raw,rsu_raw,dp
     
     else:
         if return_coldry:
@@ -139,7 +139,7 @@ def load_radscheme_rnn(fname, predictand='rsu_rsd', scale_p_h2o_o3=True, \
 
 def load_data(file_name):
 
-    x, _, rsd0, _, rsd, rsu, pres = \
+    x, _, rsd0, _, rsd, rsu, dp = \
         load_radscheme_rnn(file_name,  scale_p_h2o_o3 = True, return_p=True, return_coldry=False)
         
     xmax = np.array([3.20104980e+02, 1.15657101e+01, 4.46762830e-01, 5.68951890e-02,
@@ -160,8 +160,6 @@ def load_data(file_name):
     x_m = x[:,:,0:-1]
     n_f = x_m.shape[-1]
     x_aux1 = x[:,0,-1:]   
-
-    dp = pres[:,1:] - pres[:,0:-1] 
 
     dt = xr.open_dataset(file_name)
     tmp_selection = dt.variables['is_valid_zenith_angle'].data.astype(int)

@@ -1,0 +1,27 @@
+Year = 2009
+Total number of examples = 263703
+Number of valid examples per epoch = 260096
+Number of valid batches = 254
+Best n_epoch = 986
+2025-05-07 12:41:47.968021: I tensorflow/compiler/mlir/mlir_graph_optimization_pass.cc:185] None of the MLIR Optimization Passes are enabled (registered 2)
+2025-05-07 12:41:49.788937: I tensorflow/stream_executor/cuda/cuda_dnn.cc:369] Loaded cuDNN version 8300
+Could not load symbol cublasGetSmCountTarget from libcublas.so.11. Error: /anaconda/envs/py38_tensorflow/bin/../lib/libcublas.so.11: undefined symbol: cublasGetSmCountTarget
+254/254 [==============================] - 8s 25ms/step - loss: 1.0924e-05 - rmse_flux: 0.5148 - rmse_hr: 0.0551
+Elapsed time in seconds = 0.8148649446
+Elapsed time in ns = 8148649446
+Year = 2015
+Total number of examples = 263700
+Number of valid examples per epoch = 260096
+Number of valid batches = 254
+Best n_epoch = 986
+254/254 [==============================] - 8s 25ms/step - loss: 2.8911e-05 - rmse_flux: 0.7900 - rmse_hr: 0.1237
+Elapsed time in seconds = 0.7552528919
+Elapsed time in ns = 7552528919
+Year = 2020
+Total number of examples = 266303
+Number of valid examples per epoch = 263168
+Number of valid batches = 257
+Best n_epoch = 986
+257/257 [==============================] - 8s 23ms/step - loss: 6.2531e-05 - rmse_flux: 1.2200 - rmse_hr: 0.2001
+Elapsed time in seconds = 0.8085919116
+Elapsed time in ns = 8085919116

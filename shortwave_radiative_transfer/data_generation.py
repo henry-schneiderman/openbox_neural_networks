@@ -265,7 +265,7 @@ if __name__ == "__main__":
 
         year = '2008'
         train_input_dir = f"/data-T1/hws/CAMS/processed_data/training/{year}/"
-        cross_input_dir = f"/data-T1/hws/CAMS/processed_data/cross_validation/{year}/"
+        validation_input_dir = f"/data-T1/hws/CAMS/processed_data/validation/{year}/"
         months = [str(m).zfill(2) for m in range(1,13)]
         train_input_files = [f'{train_input_dir}nn_input-training-{year}-{month}.nc' for month in months]
 
@@ -287,7 +287,7 @@ if __name__ == "__main__":
 
         year = '2008'
         train_input_dir = f"/data-T1/hws/CAMS/processed_data/training/{year}/"
-        cross_input_dir = f"/data-T1/hws/CAMS/processed_data/cross_validation/{year}/"
+        validation_input_dir = f"/data-T1/hws/CAMS/processed_data/validation/{year}/"
         months = [str(m).zfill(2) for m in range(1,13)]
         train_input_files = [f'{train_input_dir}nn_input_sw-training-{year}-{month}.nc' for month in months]
         dt = xr.open_dataset(train_input_files[0])

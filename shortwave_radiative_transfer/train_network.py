@@ -1161,7 +1161,7 @@ def train_network():
     model_filename = model_dir + f"{name_prefix}{model_id}"
 
     train_input_dir = "/data-T1/hws/CAMS/processed_data/training/2008/"
-    validation_input_dir = "/data-T1/hws/CAMS/processed_data/cross_validation/2008/"
+    validation_input_dir = "/data-T1/hws/CAMS/processed_data/validation/2008/"
     months = [str(m).zfill(2) for m in range(1, 13)]
     train_input_files = [
         f'{train_input_dir}shortwave-training-2008-{month}.nc' for month in months]
