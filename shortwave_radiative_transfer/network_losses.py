@@ -1,3 +1,9 @@
+"""
+Loss functions for radiative transfer
+
+Author: Henry Schneiderman, henry@pittdata.com
+"""
+
 import torch
 import data_generation
 

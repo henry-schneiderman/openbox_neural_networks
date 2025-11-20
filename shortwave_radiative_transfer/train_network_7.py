@@ -1,7 +1,14 @@
 """
 Build and Train Open Box Neural Network for Shortwave Radiative Transfer
 
-train_network() - Trains neural network
+train_network_7() - Trains neural network
+  
+Same as train_network.py except
+(1) Skips transmissivity
+(2) OpticalProperty Networks replace Transmissivity / Scattering
+(3) Inputs pseudo_masses to optical property networks 
+(4) optical property networks have additional inputs for temperature and 
+  pressure
 
 Author: Henry Schneiderman, henry@pittdata.com
 """
@@ -17,19 +24,20 @@ import torch.nn.functional as F
 
 import data_generation
 import network_losses as nl
+# Used to avoid division by zero
+eps_1 = 0.0000001
 
-default_float_type = torch.float32
 
 class MLP(nn.Module):
     """
     Multi Layer Perceptron (MLP) module
 
     Fully connected layers
-    ReLU() activation for hidden layers
-    No activation for output layer
+    Uses ReLU() activation for hidden units
+    No activation for output unit
 
-    Initialization of all weights with uniform distribution with lower 
-    and upper bounds. Defaults to -0.1 < weight < 0.1
+    Initialization of all weights with uniform distribution with 'lower' 
+    and 'upper' bounds. Defaults to -0.1 < weight < 0.1
 
     Hidden units initial bias with uniform distribution 0.9 < x < 1.1
     Output unit initial bias with uniform distribution -0.1 < x <0.1
@@ -74,67 +82,46 @@ class MLP(nn.Module):
 
 class MultipleMLPs(nn.Module):
     """
-    Implementation of multiple parallel fully connected
-    networks using a single large network with block diagonal
-    masking. Each network has identical structure but different
-    weights. Set up for 8 parallel networks each with 3x1 output.
-    
-    Input unit is fully connected with dimensions n_inputs x 32 and
-    a RELU activation. It splits its 32x1 output into 4 8x1 parts that 
-    each each flow into 4 parallel hidden units. 
-    
-    Hidden units are fully connected 
-    8x8 units with RELU activation functions.
-    
-    Each output unit splits 
-    its 8x1 input into two 4x1 vectors that each pass through 
-    fully connected 4x3 units.
-    No activation function for the output layer.
-    
-    Output is size 24 = 8 x 3 
+    Block Diagonal 32 nodes per hidden layer, 24 node output layer
 
-    For computational efficiency we consolidated these independent
-    computations in a single large neural network component with masking
-    to isolate the independent computations:
-    
-    - Input layer is fully connected n_input x 32
+    Computes several fully connected modules in parallel using single
+    computation with large matrix multiplications, where the the 
+    separate computatation are split using a block diagonal matrix.
 
-    - The hidden layers are implemented as 32x32 with 4 8x8 block diagonal
-    masks to zero out inappropriate off-diagonal elements.
-    
-    - The output layer is implemented as 32x24 with 8 4x3 block diagonal
-    masks in same fashion.
-    
-    See Figure 7 in paper
+    The initial stage between the input and first layer of hidden
+    units is fully connected. All hidden layers have
+    32 nodes and that output has 24 nodes.
+    All block diagonals contain 4 8x8 masks except for output which 
+    contains 8 4x3 masks
     """
 
     def __init__(
-            self, n_input, n_hidden_layers, dropout_p, device, bias=False, requires_grad=True):
+            self, n_input, n_hidden_layers, dropout_p, device, bias=False):
 
         super(MultipleMLPs, self).__init__()
         n_hidden_nodes = 32
-        n_output_nodes = 24
+        n_output_nodes = 32
         self.n_hidden_layers = n_hidden_layers
         self.dropout_p = dropout_p
 
         weight_values = torch.rand(
-            (n_input, n_hidden_nodes), requires_grad=requires_grad,
-            device=device, dtype=default_float_type)
+            (n_input, n_hidden_nodes), requires_grad=True,
+            device=device, dtype=torch.float32)
 
         self.input_weight = nn.parameter.Parameter(weight_values,
-                                                   requires_grad=requires_grad)
+                                                   requires_grad=True)
 
         self.bias = bias
         if bias:
             bias_values = torch.rand(
-                (n_hidden_nodes,), requires_grad=requires_grad, device=device,
-                dtype=default_float_type,
+                (n_hidden_nodes,), requires_grad=True, device=device,
+                dtype=torch.float32,
             )
             self.input_bias = nn.parameter.Parameter(
-                bias_values, requires_grad=requires_grad)
+                bias_values, requires_grad=True)
             biases = []
 
-        template = torch.ones((8, 8), device=device, dtype=default_float_type)
+        template = torch.ones((8, 8), device=device, dtype=torch.float32)
         self.filter = torch.block_diag(template, template, template, template)
         weights = []
 
@@ -142,34 +129,34 @@ class MultipleMLPs(nn.Module):
         for i in range(n_hidden_layers-1):
             weights.append(
                 torch.rand(
-                    (n_last, n_hidden_nodes), requires_grad=requires_grad,
-                    device=device, dtype=default_float_type))
+                    (n_last, n_hidden_nodes), requires_grad=True,
+                    device=device, dtype=torch.float32))
             if bias:
                 biases.append(
                     torch.rand(
-                        (n_hidden_nodes,), requires_grad=requires_grad,
-                        device=device, dtype=default_float_type))
+                        (n_hidden_nodes,), requires_grad=True,
+                        device=device, dtype=torch.float32))
             n_last = n_hidden_nodes
 
         self.weights = torch.nn.ParameterList(weights)
         tmp_weights = torch.rand(
-            (n_last, n_output_nodes), requires_grad=requires_grad, device=device,
-            dtype=default_float_type)
+            (n_last, n_output_nodes), requires_grad=True, device=device,
+            dtype=torch.float32)
 
         self.output_weights = nn.parameter.Parameter(
-            tmp_weights, requires_grad=requires_grad)
+            tmp_weights, requires_grad=True)
 
         if bias:
             self.biases = torch.nn.ParameterList(biases)
             weight_values = torch.rand(
-                (n_output_nodes,), requires_grad=requires_grad, device=device,
-                dtype=default_float_type)
+                (n_output_nodes,), requires_grad=True, device=device,
+                dtype=torch.float32)
 
             self.output_bias = nn.parameter.Parameter(
-                weight_values, requires_grad=requires_grad)
+                weight_values, requires_grad=True)
 
         template = torch.ones(
-            (4, 3), device=device, dtype=default_float_type)
+            (4, 4), device=device, dtype=torch.float32)
         self.output_filter = torch.block_diag(
             template, template, template, template,
             template, template, template, template)
@@ -203,9 +190,7 @@ class MultipleMLPs(nn.Module):
 
 class LayerDistributed(nn.Module):
     """
-    Applies a nn.Module independently to an array of 
-    atmospheric layers. In particular, folds the dimension for the
-    samples with the dimension for the atmospheric layers.
+    Applies a nn.Module independently to an array of inputs (layers)
 
     Same idea as TensorFlow's TimeDistributed Class
     Adapted from:
@@ -259,8 +244,25 @@ class LayerDistributed(nn.Module):
 
 class OpticalDepth(nn.Module):
     """ 
-    Computes the optical depth for each atmospheric 
-    constituent for each channel.
+    Computes influence of each atmospheric constituent on each spectral
+    channel
+    Generates optical depth for each atmospheric 
+    constituent for each channel for the given layer.
+
+    Learns the dependence of mass extinction coefficients on temperature 
+    and pressure.
+    Hard-codes the multiplication of each mass
+    extinction coefficient by the consistuent's mass
+
+    Consider using better model for liquid water and ice water (cloud
+    optics). See (Hogan and Bozzo, 2018)
+
+    Inputs:
+        Mass of each atmospheric constituent
+        Temperature, pressure
+
+    Outputs
+        Optical depth of each constituent in each channel
     """
 
     def __init__(self, n_channel, dropout_p, device):
@@ -269,7 +271,7 @@ class OpticalDepth(nn.Module):
         self.device = device
         self.dropout_p = dropout_p
 
-        # Scalar learned weight for each constituent
+        # Computes a scalar weight for each constituent
         # for each channel
         self.net_lw = nn.Linear(1, self.n_channel, bias=False, device=device)
         self.net_iw = nn.Linear(1, self.n_channel, bias=False, device=device)
@@ -294,78 +296,63 @@ class OpticalDepth(nn.Module):
         torch.nn.init.uniform_(self.net_ch4.weight, a=lower, b=upper)
         # torch.nn.init.uniform_(self.net_co.weight, a=lower, b=upper)
 
+        # exp() activation forces weight to be non-negative
 
-        # Network modules that modify each extinction coeffient as a 
-        # function of temperature and pressure.
+        # Modifies each extinction coeffient as a function of temperature,
+        # pressure
         # Seeks to model pressuring broadening of atmospheric absorption lines
-        # Single network for each constituent over all channels
-        # Note: not applied to clouds (liquid water and ice water)
-        self.net_ke_h2o = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                              dropout_p=dropout_p, device=device)
-        self.net_ke_o3 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                             dropout_p=dropout_p, device=device)
-        self.net_ke_co2 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                              dropout_p=dropout_p, device=device)
-        self.net_ke_o2 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                             dropout_p=dropout_p, device=device)
-        self.net_ke_n2o = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                              dropout_p=dropout_p, device=device)
-        self.net_ke_ch4 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
-                              dropout_p=dropout_p, device=device)
+        # Single network for each constituent
+
         # self.net_ke_co = MLP(n_input=2,n_hidden=(6,4,4),n_output=1,
         #                      dropout_p=dropout_p,device=device)
 
-        # Hardcode some gases to have no influence on particular
-        # channels, by creating the following filters.
-
-        # Follows Table A2 in Pincus, R., Mlawer, E. J., &
+        # Filters select which channels each constituent contributes to
+        # Follows similiar assignment of bands as
+        # Table A2 in Pincus, R., Mlawer, E. J., &
         # Delamere, J. S. (2019). Balancing accuracy, efficiency, and
         # flexibility in radiation calculations for dynamical models. Journal
         # of Advances in Modeling Earth Systems, 11,3074–3089.
         # https://doi.org/10.1029/2019MS001621
 
-        # Initially create a set of 14 weights for each gas corresponding
-        # to the 14 bands defined in the paper refenced above
         filter_h2o = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,],
-                                  dtype=default_float_type, device=device)
-        # Then repeat this filter 3 times to cover 42 channels
+                                  dtype=torch.float32, device=device)
+
         self.filter_h2o = torch.cat([filter_h2o, filter_h2o, filter_h2o])
 
         filter_o3 = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1,],
-                                 dtype=default_float_type, device=device)
+                                 dtype=torch.float32, device=device)
 
         self.filter_o3 = torch.cat([filter_o3, filter_o3, filter_o3])
 
         filter_co2 = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0,],
-                                  dtype=default_float_type, device=device)
+                                  dtype=torch.float32, device=device)
 
         self.filter_co2 = torch.cat([filter_co2, filter_co2, filter_co2])
 
+        # filter_u  = torch.tensor([1,0,0,0,0, 0,0,1,1,1, 1,0,0,1],
         filter_o2 = torch.tensor([1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1],
-                                 dtype=default_float_type, device=device)
+                                 dtype=torch.float32, device=device)
 
         self.filter_o2 = torch.cat([filter_o2, filter_o2, filter_o2])
 
         filter_n2o = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                                  dtype=default_float_type, device=device)
+                                  dtype=torch.float32, device=device)
 
         self.filter_n2o = torch.cat([filter_n2o, filter_n2o, filter_n2o])
 
         filter_ch4 = torch.tensor([1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,],
-                                  dtype=default_float_type, device=device)
+                                  dtype=torch.float32, device=device)
 
         self.filter_ch4 = torch.cat([filter_ch4, filter_ch4, filter_ch4])
 
-        if False:
-            # Non-essential computations below, e.g., counting number of weights
-            
-            n_weights_decomposition = (2 * n_channel + torch.sum(self.filter_ch4)
-                                    + torch.sum(self.filter_o3) +
-                                    torch.sum(self.filter_co2)
-                                    + torch.sum(self.filter_o2) +
-                                    torch.sum(self.filter_n2o)
-                                    + torch.sum(self.filter_h2o))  # + torch.sum(self.filter_co))
+        n_weights_decomposition = (2 * n_channel + torch.sum(self.filter_ch4)
+                                   + torch.sum(self.filter_o3) +
+                                   torch.sum(self.filter_co2)
+                                   + torch.sum(self.filter_o2) +
+                                   torch.sum(self.filter_n2o)
+                                   + torch.sum(self.filter_h2o))  # + torch.sum(self.filter_co))
 
+        if False:
             n_weights_possible = 8 * n_channel
             print(
                 f'Gas decomposition possible number of weights = = {n_weights_possible}')
@@ -381,149 +368,102 @@ class OpticalDepth(nn.Module):
             print(
                 f"Optical depth number weights = {n_weights_ext} with 8 atmospheric constituents")
 
+
     def reset_dropout(self, dropout_p):
         self.dropout_p = dropout_p
-        self.net_ke_h2o.reset_dropout(dropout_p)
-        self.net_ke_o3.reset_dropout(dropout_p)
-        self.net_ke_co2.reset_dropout(dropout_p)
-        self.net_ke_o2.reset_dropout(dropout_p)
-        self.net_ke_n2o.reset_dropout(dropout_p)
-        self.net_ke_ch4.reset_dropout(dropout_p)
+
         # self.net_ke_co.reset_dropout(dropout_p)
 
-    #@torch.compile
     def forward(self, x):
-        """
-        Computes the optical depth for each atmospheric 
-        constituent for each channel.
 
-        -- Computes influence of each atmospheric constituent on each spectral
-        channel. Some of these relationships are hardcoded to zero
-        for non-active gases for particular channels.
-        -- Uses neural network component to learn the dependence of 
-        mass extinction coefficients on temperature and pressure.
-        -- Hardcodes the multiplication of each mass
-        extinction coefficient by the consistuent's mass
+        temperature_pressure, constituents = x
 
-        To do:
-        Consider using better model for liquid water and ice water (cloud
-        optics). See (Hogan and Bozzo, 2018)
-
-        Inputs:
-            Mass per unit of area of each atmospheric constituent in 
-            atmospheric layer
-            Temperature
-            Pressure
-
-        Outputs
-            Optical depth of each constituent in each channel
-        """
-        temperature_pressure, constituent_mass = x
-
-        m = constituent_mass
-        shape = m.shape
-        
-        # Add dimension to be compatible with 'channels' dimension
-        m = m.reshape((shape[0], 1, shape[1]))
+        c = constituents
+        shape = c.shape
+        c = c.reshape((shape[0], 1, shape[1]))
         t_p = temperature_pressure
 
-        # exp() constrains weight to be non-negative
-        exp = torch.exp
-        
-        # sigmoid() constrains 0 < ke(temp,pressure) < 1
-        sigmoid = torch.sigmoid
+        # Activation functions
+        a = torch.exp
 
-        # Dummy input to compute influence of atmospheric constituents
-        # on each channel
-        # Note: This may probably be avoided through an alternative implementation
+        # Dummy input to compute weights of atmospheric constituents
         one = torch.ones(
-            (shape[0], 1), dtype=default_float_type, device=self.device)
-        
-        # The optical depths for clouds assumed
-        # to be independent of Temp, Pressure
-        
-        # tau_lw : [n_examples, n_channels] * [n_examples, 1]
-        
-        tau_lw = exp(self.net_lw(one)) * m[:, :, 0]
-        tau_iw = exp(self.net_iw(one)) * m[:, :, 1]
-        
-        # tau_h2o = exp(w) * mass_h20 * ke(temp, pres) * active_filter
-        # tau_h2o : 
-        #    (n_examples, n_channels) * (n_examples, 1) * 
-        #    ((n_examples, 1) * (n_channels))
-        
-        tau_h2o = exp(self.net_h2o(one)) * m[:, :, 2] * \
-            (sigmoid(self.net_ke_h2o(t_p)) * self.filter_h2o)
-            
-        tau_o3 = exp(self.net_o3(one)) * m[:, :, 3] * \
-            (sigmoid(self.net_ke_o3(t_p)) * self.filter_o3)
-            
-        tau_co2 = exp(self.net_co2(one)) * m[:, :, 4] * \
-            (sigmoid(self.net_ke_co2(t_p)) * self.filter_co2)
+            (shape[0], 1), dtype=torch.float32, device=self.device)
+        # a(self.net_lw (one)): (n_examples, n_channels)
+        # pseudo_mass_lw : (n_examples, n_channels) * (n_examples, 1)
+        pseudo_mass_lw = a(self.net_lw(one)) * c[:, :, 0] 
+        pseudo_mass_iw = a(self.net_iw(one)) * c[:, :, 1]
+
+        # tau_h2o : (n_examples, n_channels) * (n_examples, 1) *
+        # ((n_channels)
+        pseudo_mass_h2o = a(self.net_h2o(one)) * c[:, :, 2] * self.filter_h2o
+                                                      
+        pseudo_mass_o3 = a(self.net_o3(one)) * c[:, :, 3] * self.filter_o3
+                                                      
+        pseudo_mass_co2 = a(self.net_co2(one)) * c[:, :, 4] * self.filter_co2
+                                                         
+        pseudo_mass_o2 = a(self.net_o2(one)) * c[:, :, 5] * self.filter_o2
                                                        
-        tau_o2 = exp(self.net_o2(one)) * m[:, :, 5] * \
-            (sigmoid(self.net_ke_o2(t_p)) * self.filter_o2)
+        pseudo_mass_n2o = a(self.net_n2o(one)) * c[:, :, 6] * self.filter_n2o
+                                                         
+        pseudo_mass_ch4 = a(self.net_ch4(one)) * c[:, :, 7] * self.filter_ch4
+                                                         
+        
+        # Clear sky
+        # tau_clear_total = torch.sum(tau[:,:,2:], dim=2, keepdims=False)
+        
+        pseudo_mass_lw = torch.unsqueeze(pseudo_mass_lw, 2)
+        pseudo_mass_iw = torch.unsqueeze(pseudo_mass_iw, 2)
+        pseudo_mass_h2o = torch.unsqueeze(pseudo_mass_h2o, 2)
+        pseudo_mass_o3 = torch.unsqueeze(pseudo_mass_o3, 2)
+        pseudo_mass_co2 = torch.unsqueeze(pseudo_mass_co2, 2)
 
-        tau_n2o = exp(self.net_n2o(one)) * m[:, :, 6] * \
-            (sigmoid(self.net_ke_n2o(t_p)) * self.filter_n2o)
-            
-        tau_ch4 = exp(self.net_ch4(one)) * m[:, :, 7] * \
-            (sigmoid(self.net_ke_ch4(t_p)) * self.filter_ch4)
+        pseudo_mass_o2 = torch.unsqueeze(pseudo_mass_o2, 2)
+        pseudo_mass_n2o = torch.unsqueeze(pseudo_mass_n2o, 2)
+        pseudo_mass_ch4 = torch.unsqueeze(pseudo_mass_ch4, 2)
+        # pseudo_mass_co = torch.unsqueeze(pseudo_mass_co,2)
+        
+        pseudo_mass = torch.cat([pseudo_mass_lw, pseudo_mass_iw, 
+                                 pseudo_mass_h2o, pseudo_mass_o3, 
+                                 pseudo_mass_co2, pseudo_mass_o2,
+                                 pseudo_mass_n2o, pseudo_mass_ch4], dim=2)
 
-        # tau_co = exp(self.net_co(one)) * m[:,:,8] * \
-        #     (sigmoid(self.net_ke_co(t_p)) * self.filter_co)
-
-        # Add dimension to stack optical depths into a single tensor
-        tau_lw = torch.unsqueeze(tau_lw, 2)
-        tau_iw = torch.unsqueeze(tau_iw, 2)
-        tau_h2o = torch.unsqueeze(tau_h2o, 2)
-        tau_o3 = torch.unsqueeze(tau_o3, 2)
-        tau_co2 = torch.unsqueeze(tau_co2, 2)
-
-        tau_o2 = torch.unsqueeze(tau_o2, 2)
-        tau_n2o = torch.unsqueeze(tau_n2o, 2)
-        tau_ch4 = torch.unsqueeze(tau_ch4, 2)
-        # tau_co = torch.unsqueeze(tau_co,2)
-
-        tau = torch.cat([tau_lw, tau_iw, tau_h2o, tau_o3, tau_co2, tau_o2,
-                         tau_n2o, tau_ch4], dim=2)
-
-        return tau
+        return pseudo_mass
 
 
-class Scattering(nn.Module):
+class OpticalProperties(nn.Module):
     """ 
-    Computes coefficients representing the fractions of extinguished
-    radiation that are absorbed, transmitted, and reflection
-    
-    This is the largest computational bottleneck, especially,
-    the MultipleMLPs
+    Computes split of each coefficient of extinguished radiation into 
+    three coefficients represented the fractions that are absorbed, 
+    transmitted, and reflected
+
+
     """
 
     def __init__(self, n_channel, n_constituent, dropout_p, device):
 
-        super(Scattering, self).__init__()
+        super(OpticalProperties, self).__init__()
         self.n_channel = n_channel
 
-        # DO NOT CHANGE. The MultipleMLPs assumes this value
         self.n_scattering_nets = 8  
+        n_input = n_constituent  
 
-        # Generates basis functions for selecting coefficients
-        
-        # Has additional input for zenith angle ('mu_direct')
-        self.direct_scattering = MultipleMLPs(n_input=n_constituent + 1,
-                                              n_hidden_layers=3,
-                                              dropout_p=dropout_p,
-                                              device=device,
-                                              bias=True)
+        # Has additional inputs for zenith angle ('mu_direct'), temperature
+        # and pressure
+        self.direct_scattering = MultipleMLPs(n_input=n_input + 3,
+                                          n_hidden_layers=3,
+                                          dropout_p=dropout_p,
+                                          device=device,
+                                          bias=True)
+        # Has additional inputs for temperature and pressure
+        self.diffuse_scattering = MultipleMLPs(n_input=n_input + 2,
+                                           n_hidden_layers=3,
+                                           dropout_p=dropout_p,
+                                           device=device,
+                                           bias=True)
 
-        self.diffuse_scattering = MultipleMLPs(n_input=n_constituent,
-                                               n_hidden_layers=3,
-                                              dropout_p=dropout_p,
-                                              device=device,
-                                              bias=True)
+        # Select combo of basis to give a,r,t
 
-        # Selects linear combo of 8 3x1 basis vectors to give a,r,t
         self.direct_selection = nn.Conv2d(in_channels=self.n_channel,
                                           out_channels=self.n_channel,
                                           kernel_size=(
@@ -539,14 +479,12 @@ class Scattering(nn.Module):
                                            groups=self.n_channel, bias=False, device=device)
 
         if False:
-            # Remaining computation is non-essential
-            # Compute number of weights
             n_hidden = [32, 32, 32]
-            n_weights = n_constituent * n_hidden[0] + n_hidden[0]*n_hidden[1]
+            n_weights = n_input * n_hidden[0] + n_hidden[0]*n_hidden[1]
             n_weights += n_hidden[1]*n_hidden[2] + \
-                n_hidden[2]*3*self.n_scattering_nets
+                n_hidden[2]*4*self.n_scattering_nets
             n_weights += n_hidden[0] + n_hidden[1] + \
-                n_hidden[2] + 3*self.n_scattering_nets
+                n_hidden[2] + 4*self.n_scattering_nets
             print(
                 f"Scattering potential shared weights (diffuse scattering) = {n_weights}")
             print(
@@ -558,10 +496,10 @@ class Scattering(nn.Module):
             n_weights += n_weights_2
             print(f"Scattering total number of potential weights = {n_weights}")
 
-            n_weights = n_constituent * n_hidden[0] + 64 * 4 + 64 * 4
+            n_weights = n_input * n_hidden[0] + 64 * 4 + 64 * 4
             n_weights += 12 * 8
             n_weights += n_hidden[0] + n_hidden[1] + \
-                n_hidden[2] + 3*self.n_scattering_nets
+                n_hidden[2] + 4*self.n_scattering_nets
             print(
                 f"Scattering actual shared weights (diffuse scattering) = {n_weights}")
             print(
@@ -575,96 +513,85 @@ class Scattering(nn.Module):
         self.diffuse_scattering.reset_dropout(dropout_p)
 
     def forward(self, x):
-        (tau, mu_direct, mu_diffuse,) = x
+        (pseudo_mass, temperature_pressure, mu_direct) = x
 
-        # tau [n_examples, n_channels, n_constituents]
+        # (n_examples, n_channels) / (n_examples, 1)
 
-        # Sum over constituents
-        # Full sky (as opposed to clear sky)
-        tau_full_total = torch.sum(tau, dim=2, keepdims=False)
-
-        # Clear sky
-        # tau_clear_total = torch.sum(tau[:,:,2:], dim=2, keepdims=False)
-
-        # Direct transmission coefficients
-        # Account for solar zenith angle
-        # Avoids division by zero
-        eps_1 = 0.0000001
-        t_full_direct = torch.exp(-tau_full_total / (mu_direct + eps_1))
-        t_full_diffuse = torch.exp(-tau_full_total / (mu_diffuse + eps_1))
         # t_clear = torch.exp(-tau_clear_total / (mu_direct + eps_1))
 
-        ###### Direct Radiation ###################
+        ###### Process Diffuse Radiation ###################
 
-        # add dimension to be dimensionally compatible with tau
+        # add dimension for constituents
         mu_direct = torch.unsqueeze(mu_direct, dim=2)
-        tau_full_direct = tau / (mu_direct + eps_1)
-
         mu_direct = mu_direct.repeat(1, self.n_channel, 1)
+        
+        # add dimension for channels
+        temperature_pressure = torch.unsqueeze(temperature_pressure, dim=1)
+        temperature_pressure = temperature_pressure.repeat(1, self.n_channel, 1)
+        
+        # Should pseudo_mass be divided by mu_direct? and used for 
+        # direct_scattering?
+        
+        #direct_inputs = torch.concat((temperature_pressure, 
+        #                            pseudo_mass / (mu_direct + eps_1), 
+        #                            mu_direct), dim=2)
+        #e_split_full_direct = self.direct_scattering(direct_inputs)
 
-        # Create input tensor for neural network
-        # n_features = number of constituents + 1
-        # where additional feature is for mu_direct
-        # full_direct [n_examples,n_channels,n_features]
-        full_direct = torch.concat((tau_full_direct, mu_direct), dim=2)
+        full_inputs = torch.concat((temperature_pressure, 
+                                    pseudo_mass, mu_direct), dim=2)
+        # f = number of features = number of constituents + 1
+        # [i,channels,f]
+        e_split_full_direct = self.direct_scattering(full_inputs)
 
-        # m = number of "scattering modules" that each produce
-        # a basis vector
-        # Each scattering module has 3 outputs
-        # e_split_full_direct [n_examples,n_channels, 3 * m]
-        e_split_full_direct = self.direct_scattering(full_direct)
-
-
+        # m = number of scattering nets
+        # [i,channels, 4 * m]
         n = e_split_full_direct.shape[0]
-        # e_split_full_direct [n_examples,n_channels, m, 3]
         e_split_full_direct = torch.reshape(
             e_split_full_direct,
-            (n, self.n_channel, self.n_scattering_nets, 3))
+            (n, self.n_channel, self.n_scattering_nets, 4))
 
-        # Transforms output into non-negative physical quantities
-        # that sum to 1.0
-        # Strictly speaking, this isn't necessary, but it seems like
-        # a good idea to do this to restrict the dynamic range
+        # [i,channels, m, 4]
         e_split_full_direct = F.softmax(e_split_full_direct, dim=-1)
 
-        # e_split_full_direct [n_examples,n_channels, 1, 3]
         e_split_full_direct = self.direct_selection(e_split_full_direct)
 
-        # e_split_full_direct [n_examples,n_channels,3]
+        # [i, channels, 1, 4]
+
         e_split_full_direct = torch.squeeze(e_split_full_direct, dim=-2)
 
-        # Each set of coefficients normalized to sum to 1.0
-        # Ensures conservation of energy and non-negative physical quantities
+        # [i,channels,4]
+
         e_split_full_direct = F.softmax(e_split_full_direct, dim=-1)
 
-        ###### Diffuse Radiation ###################
+        ###### Process Diffuse Radiation ###################
 
-        # n_features = number of constituents
-        # tau[n_examples,n_channels,n_features]
+        # f = number of features = number of constituents
+        # [i,channels,f]
 
-        # e_split_full_diffuse[n_examples,n_channels, m * 3]
-        e_split_full_diffuse = self.diffuse_scattering(tau)
+        # Same inputs as direct scattering except excludes mu_direct
+        e_split_full_diffuse = self.diffuse_scattering(full_inputs[:,:,:-1])
         n = e_split_full_diffuse.shape[0]
 
-        # e_split_full_diffuse[n_examples,n_channels, m, 3]
+        # [i,channels,4, m]
+
         e_split_full_diffuse = torch.reshape(
             e_split_full_diffuse,
-            (n, self.n_channel, self.n_scattering_nets, 3))
+            (n, self.n_channel, self.n_scattering_nets, 4))
 
-        # Transforms into non-negative physical quantities
+        # [i,channels, m, 4]
         e_split_full_diffuse = F.softmax(e_split_full_diffuse, dim=-1)
-        
-        # e_split_full_diffuse[n_examples,n_channels, 1, 3]
+
         e_split_full_diffuse = self.diffuse_selection(e_split_full_diffuse)
 
-        # e_split_full_diffuse[n_examples,n_channels, 3]
+        # [i, channels, 1, 4]
+
         e_split_full_diffuse = torch.squeeze(e_split_full_diffuse, dim=-2)
 
-        # Each set of coefficients normalized to sum to 1.0
-        # Ensures conservation of energy and non-negative physical quantities
+        # [i,channels,4]
+
         e_split_full_diffuse = F.softmax(e_split_full_diffuse, dim=-1)
 
-        layers = [t_full_direct, t_full_diffuse, e_split_full_direct,
+        layers = [e_split_full_direct,
                   e_split_full_diffuse]
 
         return layers
@@ -673,21 +600,20 @@ class Scattering(nn.Module):
 class MultiReflection(nn.Module):
     """ 
     Computes each layer's "multi-reflection coefficients" by accounting
-    for inter-reflection with all other layers using the 
-    adding-doubling method (no learning).
+    for interaction (multireflection) with all other layers using the 
+    Adding-Doubling method (no learning).
     """
 
     def __init__(self):
         super(MultiReflection, self).__init__()
 
     def _adding_doubling(self,
-                         t_direct, t_diffuse,
                          e_split_direct, e_split_diffuse,
                          r_surface_direct, r_surface_diffuse,
                          a_surface_direct, a_surface_diffuse):
         """
         Multireflection between a single layer and a (virtual) surface 
-        using the adding-doubling method.
+        using the Adding-Doubling Method.
 
         See p.418-424 of "A First Course in Atmospheric Radiation (2nd edition)"
         by Grant W. Petty
@@ -701,44 +627,42 @@ class MultiReflection(nn.Module):
             t_direct, t_diffuse - Direct transmission coefficients of 
                 the layer.  
                 - These are not changed by multi reflection
-                - Note that t_diffuse is for diffuse radiation that is 
-                directly transmitted (not further scattered by the layer)
+                - t_diffuse is for diffuse input that is directly 
+                transmitted.
 
             e_split_direct, e_split_diffuse - The layer's split of extinguised  
                 radiation into transmitted, reflected,
-                and absorbed fractional components. These components 
-                sum to 1.0. The transmitted and reflected components are
-                used to compute downwelling and upwelling diffuse 
-                radiative flux, respectively.
+                and absorbed components. These components 
+                sum to 1.0. The transmitted and reflected components produce
+                diffuse radiation.
 
             r_surface_direct, r_surface_diffuse - The original reflection 
-                coefficients of the (virtual) surface in isolation.
+                coefficients of the surface.
 
             a_surface_direct, a_surface_diffuse - The original absorption 
-                coefficients of the (virtual) surface in isolation. 
+                coefficients of the surface. 
 
         Returns:
 
             t_multi_direct, t_multi_diffuse - The layer's transmission
-                coefficients after accounting for multi-reflection with
-                the (virtual) surface immediately below it
+                coefficients for radiation that is multi-reflected (as 
+                opposed to directly transmitted, e.g., t_direct, t_diffuse)
 
             r_layer_multi_direct, r_layer_multi_diffuse - The layer's 
                 reflection coefficients after accounting for multi-reflection 
-                with the (virtual) surface immediately below it
+                with the surface
 
-            r_surface_multi_direct, r_surface_multi_diffuse - The (virtual)
-                surface's reflection coefficients after accounting for 
-                multi-reflection with the layer immediately above it
+            r_surface_multi_direct, r_surface_multi_diffuse - The surface's
+                reflection coefficients after accounting for 
+                multi-reflection with the layer
 
             a_layer_multi_direct, a_layer_multi_diffuse - The layer's 
                 absorption coefficients layer after accounting for 
-                multi-reflection with the (virtual) surface immediately
-                below it
+                multi-reflection with surface
 
-            a_surface_multi_direct, a_surface_multi_diffuse - The virtual
-                surface's absorption coefficients after accounting for 
-                multi-reflection with the layer immediately above it
+            a_surface_multi_direct, a_surface_multi_diffuse - The surface's
+                absorption coefficients after accounting for multi-reflection 
+                with the layer
 
         Notes:
 
@@ -761,9 +685,8 @@ class MultiReflection(nn.Module):
                 a_layer_multi_diffuse = (1 - t_diffuse - t_multi_diffuse) + 
                             (r_surface_multi_diffuse - r_layer_multi_diffuse)
 
-            When merging a (virtual) surface and a layer into 
-            a new virtual surface, the new surface's reflection 
-            coefficient is just the reflection
+            When merging the multireflected layer and the surface into 
+            a new "surface", the reflection coefficient is just the reflection
             of the layer. However, the absorption of the new surface
             is the sum of the surface and layer absorptions:
 
@@ -771,16 +694,19 @@ class MultiReflection(nn.Module):
                 a_layer_multi_direct + a_surface_multi_direct => 
                                                             a_surface_direct
 
-            Propagation, defined below, uses these 
-            multi-reflection coefficients to propagate radiation 
+            The Propagation class below uses the multi-reflection
+            coefficients to propagate radiation 
             downward from the top of the atmosphere
         """
-        # Fraction of extinguished radiaton
-        e_direct = 1.0 - t_direct
-        e_diffuse = 1.0 - t_diffuse
+        
+        t_direct = e_split_direct[:, :, 3] 
+        t_diffuse = e_split_diffuse[:, :, 3] 
+        
+        # Split out extinguished component
+        #e_direct = 1.0 
+        #e_diffuse = 1.0 
 
-        # Fractions of extinguished radiation split into transmitted, 
-        # reflected, and absorbed coefficients
+        # Split extinguished into transmitted, reflected, and absorbed
         e_t_direct, e_r_direct, e_a_direct = (e_split_direct[:, :, 0],
                                               e_split_direct[:, :, 1],
                                               e_split_direct[:, :, 2])
@@ -789,42 +715,42 @@ class MultiReflection(nn.Module):
                                                  e_split_diffuse[:, :, 2])
 
         eps = 1.0e-06
-        d = 1.0/(1.0 - e_diffuse*e_r_diffuse*r_surface_diffuse + eps)
+        d = 1.0/(1.0 - e_r_diffuse*r_surface_diffuse + eps)
 
         # Adding-Doubling for direct radiation
-        t_multi_direct = (t_direct * r_surface_direct * e_diffuse * e_r_diffuse*d
-                          + e_direct * e_t_direct * d)
+        t_multi_direct = (t_direct * r_surface_direct * e_r_diffuse*d
+                          + e_t_direct * d)
 
         a_surface_multi_direct = (t_direct * a_surface_direct
                                   + t_multi_direct * a_surface_diffuse)
 
         r_surface_multi_direct = (t_direct * r_surface_direct * d
-                                  + e_direct * e_t_direct * r_surface_diffuse * d)
+                                  + e_t_direct * r_surface_diffuse * d)
 
-        a_layer_multi_direct = (e_direct * e_a_direct
-                                + r_surface_multi_direct * e_diffuse * e_a_diffuse)
+        a_layer_multi_direct = (e_a_direct
+                                + r_surface_multi_direct * e_a_diffuse)
 
-        r_layer_multi_direct = (e_direct * e_r_direct
+        r_layer_multi_direct = (e_r_direct
                                 + r_surface_multi_direct
-                                * (t_diffuse + e_diffuse * e_t_diffuse))
+                                * (t_diffuse + e_t_diffuse))
 
         # Adding-Doubling for diffuse radiation
         t_multi_diffuse = (
-            t_diffuse * r_surface_diffuse * e_diffuse * e_r_diffuse * d
-            + e_diffuse * e_t_diffuse * d)
+            t_diffuse * r_surface_diffuse * e_r_diffuse * d
+            + e_t_diffuse * d)
 
         a_surface_multi_diffuse = (t_diffuse * a_surface_diffuse
                                    + t_multi_diffuse * a_surface_diffuse)
 
         r_surface_multi_diffuse = (t_diffuse * r_surface_diffuse * d
-                                   + e_diffuse * e_t_diffuse * r_surface_diffuse*d)
+                                   + e_t_diffuse * r_surface_diffuse*d)
 
-        a_layer_multi_diffuse = (e_diffuse * e_a_diffuse
-                                 + r_surface_multi_diffuse * e_diffuse * e_a_diffuse)
+        a_layer_multi_diffuse = (e_a_diffuse
+                                 + r_surface_multi_diffuse * e_a_diffuse)
 
-        r_layer_multi_diffuse = (e_diffuse * e_r_diffuse
+        r_layer_multi_diffuse = (e_r_diffuse
                                  + r_surface_multi_diffuse
-                                 * (t_diffuse + e_diffuse * e_t_diffuse))
+                                 * (t_diffuse + e_t_diffuse))
 
         return (t_multi_direct, t_multi_diffuse,
                 r_layer_multi_direct, r_layer_multi_diffuse,
@@ -834,16 +760,16 @@ class MultiReflection(nn.Module):
 
     def forward(self, x):
         """
-        Traverses the atmospheric layers from the surface to the 
-        top of the atmosphere. At each layer computes "multi-reflection"  
+        Traverses the atmospheric layer from the surface to the 
+        top of the atmosphere. At each layer generates "multi-reflection"  
         coefficients modeling the effects of inter-reflection among
         the layers.
 
         The algorithm begins by computing the inter-reflection between 
-        the surface and the nearest layer. It then
+        the surface and the nearest surface. It then
         merges this surface and layer into a new "virtual suface."
         The next iteration repeats this process with the virtual surface
-        and the next nearest layer. The iterations continue until reaching 
+        the next layer. The iterations continue until reaching 
         the top of the atmosphere (toa).
 
         Computations are independent across channel.
@@ -854,9 +780,8 @@ class MultiReflection(nn.Module):
 
         radiative_layers, x_surface = x
 
-        t_direct, t_diffuse, e_split_direct, e_split_diffuse = radiative_layers
+        e_split_direct, e_split_diffuse = radiative_layers
 
-        # Reflection and absorption coefficients at surface
         # Add dimension for channels (but with length of 1)
         r_surface = x_surface[:, 1:2]
         a_surface = 1.0 - x_surface[:, 1:2]
@@ -872,12 +797,11 @@ class MultiReflection(nn.Module):
         a_layer_multi_direct_list = []
         a_layer_multi_diffuse_list = []
 
-        # Start at the original surface and move up
+        # Start at the original surface and the first layer and move up
         # one atmospheric layer for each iteration
-        for i in reversed(torch.arange(start=0, end=t_direct.shape[1])):
+        for i in reversed(torch.arange(start=0, end=e_split_direct.shape[1])):
             # compute multi-reflection coefficients
-            multireflected_info = self._adding_doubling(t_direct[:, i, :],
-                                                        t_diffuse[:, i, :],
+            multireflected_info = self._adding_doubling(
                                                         e_split_direct[:,
                                                                        i, :, :],
                                                         e_split_diffuse[:,
@@ -892,8 +816,7 @@ class MultiReflection(nn.Module):
              a_layer_multi_direct, a_layer_multi_diffuse,
              a_surface_multi_direct, a_surface_multi_diffuse) = multireflected_info
 
-            # Merge the layer and (virtual) surface forming a new 
-            # virtual surface
+            # Merge the layer and surface forming a new "virtual surface"
             r_surface_direct = r_layer_multi_direct
             r_surface_diffuse = r_layer_multi_diffuse
             a_surface_direct = a_layer_multi_direct + a_surface_multi_direct
@@ -924,12 +847,14 @@ class MultiReflection(nn.Module):
             r_surface_multi_diffuse, dims=(1,))
         a_layer_multi_direct = torch.flip(a_layer_multi_direct, dims=(1,))
         a_layer_multi_diffuse = torch.flip(a_layer_multi_diffuse, dims=(1,))
+        
+        t_direct = e_split_direct[:, :, :, 3] 
+        t_diffuse = e_split_diffuse[:, :, :, 3] 
 
         multireflected_layers = [t_direct, t_diffuse,
                                  t_multi_direct, t_multi_diffuse,
                                  r_surface_multi_direct, r_surface_multi_diffuse,
                                  a_layer_multi_direct, a_layer_multi_diffuse]
-        
         # The reflection coefficient at the top of the atmosphere
         # is the reflection coefficient of top layer
         upward_reflection_toa = r_layer_multi_direct
@@ -938,12 +863,13 @@ class MultiReflection(nn.Module):
 
 class Propagation(nn.Module):
     """
-    Propagates flux from the top of the atmosphere to the
-    surface, making a single pass through the atmospheric layers
+    Propagate flux from the top of the atmosphere to the
+    surface.
+    Makes a single pass through the atmosphere
 
-    Values for flux_direct, flux_diffuse propagate into each layer for
-    each channel: 
-                
+    Consider two downward fluxes entering the layer: 
+                flux_direct, flux_diffuse
+
     Downward Direct Flux Transmitted = flux_direct * t_direct
     Downward Diffuse Flux Transmitted = 
                     flux_direct * t_multi_direct + 
@@ -956,8 +882,8 @@ class Propagation(nn.Module):
                         flux_direct * r_surface_multi_direct +
                         flux_diffuse * r_surface_multi_diffuse
 
-    Upward fluxes are diffuse only because they are due to scattering
-    of the downward fluxes
+    Upward fluxes are diffuse since they are from radiation
+    that is scattered upwards
     """
 
     def __init__(self, n_channel):
@@ -983,30 +909,29 @@ class Propagation(nn.Module):
 
         flux_absorbed = []
 
-        # Propagate radiation downward through the atmospheric layers
+        # Propagate downward through the atmospheric layers
         for i in range(t_direct.shape[1]):
 
             flux_absorbed.append(
-                flux_direct * a_layer_multi_direct[:, i] + 
-                flux_diffuse * a_layer_multi_diffuse[:, i])
+                flux_direct * a_layer_multi_direct[:, i] + flux_diffuse * a_layer_multi_diffuse[:, i])
 
-            # May want this later to incorporate surface interactions:
+            # Will want this later when incorporate surface interactions:
             # flux_absorbed_surface = flux_direct * a_surface_multi_direct + \
             # flux_diffuse * a_surface_multi_diffuse
 
             flux_down_direct.append(flux_direct * t_direct[:, i])
             flux_down_diffuse.append(
-                flux_direct * t_multi_direct[:, i] +
-                flux_diffuse * (t_diffuse[:, i] + t_multi_diffuse[:, i]))
+                flux_direct * t_multi_direct[:, i]
+                + flux_diffuse * (t_diffuse[:, i] + t_multi_diffuse[:, i]))
 
             flux_up_diffuse.append(
-                flux_direct * r_surface_multi_direct[:, i] +
-                flux_diffuse * r_surface_multi_diffuse[:, i])
+                flux_direct * r_surface_multi_direct[:, i]
+                + flux_diffuse * r_surface_multi_diffuse[:, i])
 
             flux_direct = flux_down_direct[-1]
             flux_diffuse = flux_down_diffuse[-1]
 
-        # stack atmospheric layers in a tensor
+        # stack atmospheric layers
         flux_down_direct = torch.stack(flux_down_direct, dim=1)
         flux_down_diffuse = torch.stack(flux_down_diffuse, dim=1)
         flux_up_diffuse = torch.stack(flux_up_diffuse, dim=1)
@@ -1023,12 +948,8 @@ class Propagation(nn.Module):
 
 
 class FullNet(nn.Module):
-    """ 
-    Top level class for the neural network
-    
-    Computes full radiative transfer (direct and diffuse radiation)
-    for an atmospheric column 
-    """
+    """ Computes full radiative transfer (direct and diffuse radiation)
+    for an atmospheric column """
 
     def __init__(self, n_channel, n_constituent, dropout_p, device):
         super(FullNet, self).__init__()
@@ -1044,86 +965,72 @@ class FullNet(nn.Module):
         self.spectral_net = nn.Linear(1, n_channel, bias=False, device=device)
         torch.nn.init.uniform_(self.spectral_net.weight, a=0.4, b=0.6)
 
-        # Learns weights for computing optical depth for each 
-        # constituent for each channel. 
-        # Same for all atmospheric layers
+        # Learns optical depth for each layer for each constituent for
+        # each channel
         self.optical_depth_net = LayerDistributed(OpticalDepth(n_channel,
                                                                dropout_p,
                                                                device))
-        # Learns weights for computing scattering for each channel.
-        # Same for all atmospheric layers 
-        self.scattering_net = LayerDistributed(Scattering(n_channel,
+
+        self.optical_properties_net = LayerDistributed(OpticalProperties(n_channel,
                                                           n_constituent,
                                                           dropout_p,
                                                           device))
-        # Combines optical properties of atmospheric layers
-        # accounting for inter-reflection.
-        # Uses adding-doubling algorithm. Math only. No learning.
+
         self.multireflection_net = MultiReflection()
 
-        # Propagates radiation from top of atmosphere to surface
-        # Math only. No learning.
+        # Propagates radiation from top of atmosphere (TOA) to surface
         self.propagation_net = Propagation(n_channel)
 
     def reset_dropout(self, dropout_p):
         self.optical_depth_net.reset_dropout(dropout_p)
-        self.scattering_net.reset_dropout(dropout_p)
+        self.optical_properties_net.reset_dropout(dropout_p)
 
     def forward(self, x):
 
         x_layers, x_surface, _, _, _, = x
 
-        # inputs for each layer: temp, pressure, masses of atmospheric 
-        # constituents per unit area
-        (temperature_pressure, constituent_mass) = (x_layers[:, :, 0:2],
-                                                    x_layers[:, :, 2:10])
+        (temperature_pressure,
+         constituents) = (x_layers[:, :, 0:2],
+                          x_layers[:, :, 2:10])
 
         mu_direct = x_surface[:, 0]
 
-        # Dummy input of ones to network for diffuse effective zenith angle
-        one = torch.ones((1,), dtype=default_float_type,
+        one = torch.ones((1,), dtype=torch.float32,
                          device=self.device)
 
         mu_diffuse = torch.sigmoid(self.mu_diffuse_net(one))
         mu_diffuse = mu_diffuse.reshape((-1, 1, 1))
-
-        # [1, n_layers, 1]
+        # mu_diffuse = torch.unsqueeze(mu_diffuse,dim=(1,2))
+        # (1, n_layers, 1)
         mu_diffuse = mu_diffuse.repeat(
             [x_layers.shape[0], x_layers.shape[1], 1])
 
+        # mu_direct = torch.unsqueeze(mu_direct,dim=(1,2))
         mu_direct_layered = mu_direct.reshape((-1, 1, 1))
-        # [n_examples, n_layers, 1]
+        # (n_examples, n_layers, 1)
         mu_direct_layered = mu_direct_layered.repeat([1, x_layers.shape[1], 1])
 
-        # Compute optical depth across examples, layers, channels and
-        # atmospheric constituents
-        
-        # [n_examples, n_layers, n_channels, n_constituents]
-        tau = self.optical_depth_net((temperature_pressure,
-                                      constituent_mass))
-        
-        # Compute scattering coefficients
-        layers = self.scattering_net((tau, mu_direct_layered, mu_diffuse,))
+        # (n_examples, n_layers, n_channels, n_constituents)
+        pseudo_mass = self.optical_depth_net((temperature_pressure,
+                                      constituents))
 
-        # Compute multilayer coefficients
+        layers = self.optical_properties_net((pseudo_mass, temperature_pressure,
+                                      mu_direct_layered))
+
         (multireflected_layers,
          upward_reflection_toa) = self.multireflection_net((layers, x_surface,))
 
-        # Compute split of incoming direct flux
-        flux_direct = F.softmax(self.spectral_net(one), dim=-1) \
-            * self.solar_constant
-        
-        # Account for solar zenith angle
+        flux_direct = F.softmax(self.spectral_net(
+            one), dim=-1) * self.solar_constant
         flux_direct = torch.unsqueeze(
             flux_direct, dim=0) * mu_direct.reshape((-1, 1))
+        # flux_direct = flux_direct.repeat([mu_direct.shape[0],1])
 
-        # set incoming diffuse flux to zero
         flux_diffuse = torch.zeros((mu_direct.shape[0], self.n_channel),
-                                   dtype=default_float_type,
+                                   dtype=torch.float32,
                                    device=self.device)
         input_flux = [flux_direct, flux_diffuse]
 
-        # Propagate radiation from top of atmosphere to surface
         flux = self.propagation_net((multireflected_layers,
                                     upward_reflection_toa,
                                     input_flux))
@@ -1158,10 +1065,7 @@ def train_loop(dataloader, model, optimizer, loss_function, loss_weights, device
 
 
 def test_loop(dataloader, model, loss_functions, loss_names, loss_weights, device):
-    """ 
-    Generic testing / evaluation loop 
-    Used for evaluation error on validation data
-    """
+    """ Generic testing / evaluation loop """
     model.eval()
     num_batches = len(dataloader)
 
@@ -1184,24 +1088,29 @@ def test_loop(dataloader, model, loss_functions, loss_names, loss_weights, devic
     return loss
 
 
+
 def get_loss_weights(n):
-    """ Weight schedule for the open box loss function"""
-    if n <= 200:
+    if n <= 135:
         loss_weights = [2.0, 1.0, 0.5, 0.25]
-    elif n <= 285:
+    elif n <= 270:
         loss_weights = [1.0, 1.0, 0.5, 0.5]
-    elif n <= 360:
-        loss_weights = [1.0, 1.0, 1.0, 1.0]
-    elif n <= 515:
-        loss_weights = [1.0, 1.0, 2.0, 2.0]
+    elif n <= 340:
+        loss_weights = [0.5, 0.5, 1.0, 1.0]
+    elif n <= 341:
+        loss_weights = [2.0, 1.0, 0.5, 0.25]
+    elif n <= 400:
+        loss_weights = [1.0, 1.0, 0.5, 0.5]
+    elif n <= 460:
+        loss_weights = [1.0, 2.0, 0.5, 1.0]
+    elif n <= 660:
+        loss_weights = [0.5, 0.5, 1.0, 1.0]
     else:
-        loss_weights = [1.0, 1.0, 0.5, 0.5]
+        loss_weights = [1.0, 1.0, 1.0, 1.0]
     return loss_weights
 
-
 def get_dropout(n, n_epochs):
-    dropout_schedule = (0.0, 0.07, 0.1, 0.15, 0.2, 0.15, 0.1, 0.07, 0.0, 0.0)
-    dropout_epochs = (-1, 40, 60, 70,  80, 90,  105, 120, 135, n_epochs + 1)
+    dropout_schedule = (0.0, 0.10, 0.0, 0.0)
+    dropout_epochs = (-1, 40, 60, n_epochs + 1)
 
     dropout_index = next(i for i, epoch in enumerate(
         dropout_epochs) if n <= epoch) - 1
@@ -1210,13 +1119,14 @@ def get_dropout(n, n_epochs):
 
 
 def train_network():
+    
     """
     train_network()
     
-    Top level script for training neural network
+    High level script for training neural network
     
-    Can train network from scatch: n_start = 0
-    or resume training from a specified epoch: n_start = [epoch]
+    Can train network from scatch: t_start = 0
+    Or resume training from a specified epoch: t_start = [epoch]
     """
 
     print("Pytorch version:", torch.__version__)
@@ -1238,46 +1148,27 @@ def train_network():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    ########################
-    # Settings for each experiment
-    
+    n_initial_models = 4
     # Set epoch at which to start training. May continue from any
     # epoch for which model exists. Otherwise, set to zero to start 
     # from scratch
     n_start = 0
-    
-    # For 1st epoch may want to try multiple models and select
-    # the best one from which to continue training
-    n_initial_models = 4
-    
     # If n_start == 1, then n_best must be set to index
     # of best initial model
-    n_best = n_start #3  # -1
+    n_best = n_start
 
-    # Used as part of file names for model
-    model_id = "v2.2."
-    #
+    model_id = "v7.2."
+
     ############################
-    
-    # Settings below probably doesn't need to change
-    
     batch_size = 1024
-    
-    # Maximum number of epochs
     n_epochs = 2000
-    
-    # Minimum number of epochs before applying stopping criterion
-    n_windup = 200 
-    
-    # If loss does not decrease for this many epochs, training stops
+    n_windup = 200
     n_stop_training = 50
-    
-    # Writes model to disk every nth epoch
     checkpoint_period = 5
 
     model_dir = "/data-T1/hws/models/"
-    model_name_prefix = 'openbox.shortwave.'
-    model_filename = model_dir + f"{model_name_prefix}{model_id}"
+    name_prefix = 'openbox.shortwave.'
+    model_filename = model_dir + f"{name_prefix}{model_id}"
 
     train_input_dir = "/data-T1/hws/CAMS/processed_data/training/2008/"
     validation_input_dir = "/data-T1/hws/CAMS/processed_data/validation/2008/"
@@ -1287,16 +1178,14 @@ def train_network():
     validation_input_files = [
         f'{validation_input_dir}shortwave-validation-2008-{month}.nc' for month in months]
 
-    ##################################
-    # DO NOT CHANGE. Assumed by OpticalDepth
     n_channel = 42
+    ##################################
+    # DO NOT CHANGE. Hardcoded within OpticalDepth
     n_constituent = 8
     ##################
 
-    # loss value of last best model (minimum validation error)
     best_loss = 1.0e+08
 
-    # number of epochs elapsed since a last best model (minimum validation error)
     n_elapsed_best = 0
 
     print("Loading training dataset")
@@ -1313,20 +1202,16 @@ def train_network():
     validation_dataloader = torch.utils.data.DataLoader(
         validation_dataset, batch_size, shuffle=False, num_workers=1)
 
-    # Only the first loss function is used to determine stopping criterion
-    # Others are just printed to the screen
     loss_functions = (
-        nl.openbox_rmse,  nl.flux_rmse, nl.heating_rate_rmse, 
-        nl.direct_flux_rmse,
+        nl.openbox_rmse,  nl.flux_rmse, nl.direct_flux_rmse,
         nl.diffuse_flux_rmse, nl.flux_bias,
-        nl.direct_extinction_rmse,
+        nl.heating_rate_rmse, nl.direct_extinction_rmse,
         nl.diffuse_heating_rate_rmse)
 
     loss_names = (
-        "Openbox RMSE", "Flux RMSE", "Heating Rate RMSE", 
-        "Direct Flux RMSE",
+        "Openbox RMSE", "Flux RMSE", "Direct Flux RMSE",
         "Diffuse Flux RMSE", "Flux Bias",
-        "Direct Extinction RMSE",
+        "Heating Rate RMSE", "Direct Extinction RMSE",
         "Diffuse Heating Rate RMSE")
 
     dropout_p = 0.0
@@ -1354,8 +1239,7 @@ def train_network():
 
             loss = test_loop(validation_dataloader, model, loss_functions,
                              loss_names, loss_weights, device)
-            
-            # Use first loss function (openbox_rmse)
+
             if loss[0] < best_loss:
                 best_loss = loss[0]
                 n_best = n
@@ -1370,6 +1254,7 @@ def train_network():
                 print(f' Wrote Initial Model: {n}')
 
     if n_start == 1:
+        n_best = n_start
         model_filename_input = f'{model_filename}i' + str(n_best).zfill(2)
     else:
         model_filename_input = model_filename + str(n_start).zfill(3)
@@ -1381,17 +1266,13 @@ def train_network():
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     last_loss_weights = []
-    n_best = n_start
 
     for n in range(n_start, n_epochs):
-        # Train the remaining epochs
         print(f"Epoch = {n}")
 
-        # Weights for open box loss function
         loss_weights = get_loss_weights(n)
 
         if loss_weights != last_loss_weights:
-            # If loss weighting changes, reset appropriate variables
             last_loss_weights = loss_weights
             print(f"New loss weights = {loss_weights}")
             # Reset best loss
@@ -1408,7 +1289,6 @@ def train_network():
         train_loop(train_dataloader, model, optimizer, nl.openbox_rmse,
                    loss_weights, device)
 
-        # Evaluate loss functions on validation data
         loss = test_loop(validation_dataloader, model, loss_functions,
                          loss_names, loss_weights, device)
 
@@ -1416,8 +1296,6 @@ def train_network():
         if n % checkpoint_period == 0:
             is_write_model = True
 
-        # Check if performance on validation has improved
-        # Use first loss function (openbox_rmse)
         if loss[0] < best_loss:
             best_loss = loss[0]
             if n - n_best > n_elapsed_best:
@@ -1439,7 +1317,6 @@ def train_network():
                 model_filename + str(n).zfill(3))
             print(f' Wrote Model: epoch = {n}')
 
-        # Check for stopping condition
         if n - n_best >= n_stop_training and n > n_windup:
             n_elapsed_best = n - n_best
             print(f"Max elapsed = {n_elapsed_best}")

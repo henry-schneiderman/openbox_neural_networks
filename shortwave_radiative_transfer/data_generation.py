@@ -1,3 +1,12 @@
+"""
+Dataset preparation for using torch.utils.data.DataLoader
+The Dataloader automatically batches large datasets, so that 
+the entire dataset does not need to be in memory at once.
+Also, reshuffles data for each training epoch.
+
+Author: Henry Schneiderman, henry@pittdata.com
+"""
+
 import numpy as np
 import random
 import xarray as xr
@@ -16,17 +25,29 @@ def absorbed_flux_to_heating_rate(absorbed_flux, delta_pressure):
     flux_div_delta_pressure = absorbed_flux / delta_pressure
     return -(g/cp) * 24.0 * 3600.0 * flux_div_delta_pressure
 
-def tensorize(np_ndarray, is_integer=False):
+def tensorize(np_ndarray, is_integer=False, default_float_type=torch.float32):
     if is_integer:
         t = torch.from_numpy(np_ndarray).int()
     else:
-        t = torch.from_numpy(np_ndarray).float()
+        t = torch.from_numpy(np_ndarray).to(default_float_type)
     return t
 
-# is_clear_sky is a hack. The clear sky data is automatically included.
-# However, when is_clear_sky the full sky data is swapped for the 
-# clear sky data
-def load_data(file, file_index, is_clear_sky):
+# Handling of clear sky data is a hack. The clear sky data is 
+# automatically included, however, when is_clear_sky=True the 
+# full sky data is swapped out for the 
+# clear sky data in the returned data
+
+def load_data(file, file_index, is_clear_sky, default_float_type=torch.float32):
+    """
+    Inputs a netcdf file.
+    Converts data from xarray to numpy.
+    Checks for nan's
+    Normalizes range of variables to zero mean +/- 1 or 
+    from 0 to 1.
+    Normalization is global (not layer-wise)
+    Converts vars to tensor
+    """
+    
     data = file
 
     temperature_pressure = data.variables['temp_pres_level'][:,:,:].data
@@ -161,10 +182,18 @@ def load_data(file, file_index, is_clear_sky):
     sites = np.concatenate(t2)
     sites = sites[selection]
 
-    return tensorize(x_layers), tensorize(x_surface), tensorize(delta_pressure), tensorize(y), tensorize(sites, is_integer=True)
+    return tensorize(x_layers, default_float_type=default_float_type), tensorize(x_surface, default_float_type=default_float_type), tensorize(delta_pressure, default_float_type=default_float_type), tensorize(y, default_float_type=default_float_type), tensorize(sites, is_integer=True, default_float_type=default_float_type)
 
 
 class RTDataSet(Dataset):
+    """
+    Puts data into a RTDataSet
+    
+    Reads dataset incrementally from multiple files
+    Shuffles list of files with each epoch
+    Shuffles data within each file for each epoch
+    """
+    
     # With shuffle of data files, too
     def __free_memory(self):
         del self.x_layers
@@ -188,13 +217,14 @@ class RTDataSet(Dataset):
             random.shuffle(a)
             self.e_shuf.append(a)
 
-    def __init__(self, input_files, is_clear_sky):
+    def __init__(self, input_files, is_clear_sky, default_float_type=torch.float32):
         self.dt = [xr.open_dataset(f) for f in input_files]
         self.n_data_accumulated = []
         self.n_data = []
         self.last_index = 0
         self.epoch_count = 0
         self.is_clear_sky = is_clear_sky
+        self.default_float_type = default_float_type
         acc = 0
         for d in self.dt:
             c = int(np.sum(d['is_valid_zenith_angle'].data))
@@ -229,14 +259,14 @@ class RTDataSet(Dataset):
             self.epoch_count += 1
             self.i_file = 0
             self.__reshuffle()
-            data = load_data(self.dt[self.m_shuf[self.i_file]], self.m_shuf[self.i_file], is_clear_sky=self.is_clear_sky)
+            data = load_data(self.dt[self.m_shuf[self.i_file]], self.m_shuf[self.i_file], is_clear_sky=self.is_clear_sky, default_float_type=self.default_float_type)
             self.x_layers, self.x_surface, self.delta_pressure, self.y, self.sites = data
 
         elif idx == self.n_data_accumulated[self.i_file]:
             # Starting new file of data
             self.i_file = self.i_file + 1
             self.__free_memory()
-            data = load_data(self.dt[self.m_shuf[self.i_file]], self.m_shuf[self.i_file], is_clear_sky=self.is_clear_sky)
+            data = load_data(self.dt[self.m_shuf[self.i_file]], self.m_shuf[self.i_file], is_clear_sky=self.is_clear_sky, default_float_type=self.default_float_type)
             self.x_layers, self.x_surface, self.delta_pressure, self.y, self.sites = data
 
         assert self.x_layers.shape[0] == self.e_shuf[self.i_file].shape[0], f"len of x_layers = {self.x_layers.shape[0]}, len of shuff = {self.e_shuf[self.i_file].shape[0]}"
@@ -259,7 +289,7 @@ class RTDataSet(Dataset):
 
     
 if __name__ == "__main__":
-    # Testing
+    # Testing only
     if False:
         batch_size = 2048
 
@@ -291,6 +321,6 @@ if __name__ == "__main__":
         months = [str(m).zfill(2) for m in range(1,13)]
         train_input_files = [f'{train_input_dir}nn_input_sw-training-{year}-{month}.nc' for month in months]
         dt = xr.open_dataset(train_input_files[0])
-        x = load_data(dt, 1, is_clear_sky=False)
+        x = load_data(dt, 1, is_clear_sky=False, default_float_type=torch.float32)
 
 
