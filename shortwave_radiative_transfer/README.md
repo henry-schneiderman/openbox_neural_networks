@@ -21,7 +21,7 @@ train_network_4.py - Modified network containing a scattering component that pro
 
 train_network_5.py, train_network_6.py - Modified neural networks that have only 28 and 14 spectral channels, instead of 42, as described in Section 4.g. <br>
 
-train_network_7.py - Modified neural network that replaces the transmissivity and scattering components with an approach that attempts to learn each layer's radiative properties without embedding any physics (except conservation of energy) as described in Section 4.h. <br>
+train_network_7.py - Modified neural network that replaces the transmissivity and scattering components with an approach that attempts to learn each layer's radiative properties without embedding Beer's Law as described in Section 4.h. <br>
 
 data_generation.py - Fetches and preprocesses data. Used by training and evaluation<br>
 
