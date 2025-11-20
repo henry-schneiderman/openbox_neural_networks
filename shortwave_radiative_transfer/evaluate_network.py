@@ -1,6 +1,9 @@
 """
 For evaluating and analyzing performance of open box networks trained by
-train_network.py, train_network_3.py, etc. for shortwave radiative transfer
+train_network.py, train_network_3.py, ..., training_network_7.py
+
+Note: contains slightly altered versions of some of the classes in
+training_network.py
 
 Author: Henry Schneiderman, henry@pittdata.com
 """
@@ -12,6 +15,7 @@ import torch.nn.functional as F
 from netCDF4 import Dataset
 import time
 
+# Specify network to evaluate by importing it as "tn"
 #import train_network_3 as tn
 import train_network as tn
 import data_generation
@@ -29,17 +33,27 @@ t_division = 0.0
 t_first_operation = 0.0
 t_surface = 0.0
 
-
 class ScatteringTiming(nn.Module):
     """ 
-    Almost the same as train_network.py.
-    Has a final computation that simplifiies MultiReflectionTiming
+    The same as Scattering in train_network.py except 
+    final computation normalizes outputs such that:
+     
+        e_t_direct + e_r_direct + e_a_direct + t_direct = 1.0
+        e_t_diffuse + e_r_diffuse + e_a_diffuse + t_diffuse = 1.0
+        
+    MultiReflectionTiming (below) assumes this normalization
+        
+    Whereas, Scattering and Multireflection in training_network.py 
+    use the following normalization:
+        e_r_direct + e_a_direct + t_direct = 1.0
+        e_r_diffuse + e_a_diffuse + t_diffuse = 1.0
     
-    Includes code that will simplify Multireflection
+    -------------
+    Computes coefficients representing the fractions of extinguished
+    radiation that are absorbed, transmitted, and reflection
     
-    Splits extinguished radiation into 
-    fractions that are absorbed, 
-    transmitted, and reflected
+    This is the largest computational bottleneck, especially,
+    the MultipleMLPs
     """
 
     def __init__(self, n_channel, n_constituent, dropout_p, device):
@@ -124,15 +138,16 @@ class ScatteringTiming(nn.Module):
         (tau, mu_direct, mu_diffuse,) = x
 
 
-        # tau (n_examples, n_channels, n_constituents)
+        # tau [n_examples, n_channels, n_constituents]
 
         # Sum over constituents
-        # Full sky
+        # Full sky (as opposed to clear sky)
         tau_full_total = torch.sum(tau, dim=2, keepdims=False)
 
         # Clear sky
         # tau_clear_total = torch.sum(tau[:,:,2:], dim=2, keepdims=False)
 
+        # Direct transmission coefficients
         # Account for solar zenith angle
         # Avoids division by zero
         eps_1 = 0.0000001
@@ -140,7 +155,7 @@ class ScatteringTiming(nn.Module):
         t_full_diffuse = torch.exp(-tau_full_total / (mu_diffuse + eps_1))
         # t_clear = torch.exp(-tau_clear_total / (mu_direct + eps_1))
 
-        ###### Process Diffuse Radiation ###################
+        ###### Direct Radiation ###################
 
         # add dimension (to be dimensionally compatible with tau)
         mu_direct = torch.unsqueeze(mu_direct, dim=2)
@@ -154,11 +169,10 @@ class ScatteringTiming(nn.Module):
         # full_direct [n_examples,n_channels,n_features]
         full_direct = torch.concat((tau_full_direct, mu_direct), dim=2)
 
-        # m = number of "scattering modules"
+        # m = number of "scattering modules" that each produce
+        # a basis vector
         # Each scattering module has 3 outputs
         # e_split_full_direct [n_examples,n_channels, 3 * m]
-        
-
         e_split_full_direct = self.direct_scattering(full_direct)
 
 
@@ -183,7 +197,7 @@ class ScatteringTiming(nn.Module):
         # Ensures conservation of energy and non-negative physical quantities
         e_split_full_direct = F.softmax(e_split_full_direct, dim=-1)
 
-        ###### Process Diffuse Radiation ###################
+        ###### Diffuse Radiation ###################
 
         # n_features = number of constituents
         # tau[n_examples,n_channels,n_features]
@@ -210,10 +224,11 @@ class ScatteringTiming(nn.Module):
         # Ensures conservation of energy and non-negative physical quantities
         e_split_full_diffuse = F.softmax(e_split_full_diffuse, dim=-1)
         
-        #e_split_full_direct = (1.0 - t_full_direct.unsqueeze(2)) * e_split_full_direct
-        #e_split_full_diffuse = (1.0 - t_full_diffuse.unsqueeze(2)) * e_split_full_diffuse
-
-        # Simplifies computation in multireflection
+        # Simplifies computation in MultiReflectionTiming by making the 
+        # following normalization:
+        #       e_t_direct + e_r_direct + e_a_direct + t_direct = 1.0
+        #       e_t_diffuse + e_r_diffuse + e_a_diffuse + t_diffuse = 1.0
+        
         e_t_direct = (1.0 - t_full_direct) * e_split_full_direct[:,:,0]
         e_r_direct = (1.0 - t_full_direct) * e_split_full_direct[:,:,1]
         e_a_direct = (1.0 - t_full_direct) * e_split_full_direct[:,:,2]
@@ -240,7 +255,8 @@ class MultiReflectionTiming(nn.Module):
     Whereas the version in training_network.py assumes:
         e_r_direct + e_a_direct + t_direct = 1.0
         e_r_diffuse + e_a_diffuse + t_diffuse = 1.0
-    
+        
+    ----------------------------------------------------
     Computes each layer's "multi-reflection coefficients" by accounting
     for multireflection with all other layers using the 
     Adding-Doubling method (no learning).
@@ -258,7 +274,7 @@ class MultiReflectionTiming(nn.Module):
                          a_surface_direct, a_surface_diffuse):
         """
         Multireflection between a single layer and a (virtual) surface 
-        using the Adding-Doubling Method.
+        using the adding-doubling method.
 
         See p.418-424 of "A First Course in Atmospheric Radiation (2nd edition)"
         by Grant W. Petty
@@ -273,19 +289,20 @@ class MultiReflectionTiming(nn.Module):
                 the layer.  
                 - These are not changed by multi reflection
                 - Note that t_diffuse is for diffuse radiation that is 
-                directly transmitted.
+                directly transmitted (not further scattered by the layer)
 
             e_split_direct, e_split_diffuse - The layer's split of extinguised  
                 radiation into transmitted, reflected,
                 and absorbed fractional components. These components 
-                sum to 1.0. The transmitted and reflected components become
-                diffuse radiative flux.
+                sum to 1.0. The transmitted and reflected components are
+                used to compute downwelling and upwelling diffuse 
+                radiative flux, respectively.
 
             r_surface_direct, r_surface_diffuse - The original reflection 
-                coefficients of the surface.
+                coefficients of the (virtual) surface in isolation.
 
             a_surface_direct, a_surface_diffuse - The original absorption 
-                coefficients of the surface. 
+                coefficients of the (virtual) surface in isolation. 
 
         Returns:
 
@@ -341,14 +358,14 @@ class MultiReflectionTiming(nn.Module):
                 a_layer_multi_direct + a_surface_multi_direct => 
                                                             a_surface_direct
 
-            The Python Propagation Class defined below uses the 
+            Propagation, defined below, uses these 
             multi-reflection coefficients to propagate radiation 
             downward from the top of the atmosphere
         """
+
         torch.cuda.synchronize()
         t_0 = time.time()
         
-
         # Fractions of extinguished radiation split into transmitted, 
         # reflected, and absorbed coefficients
 
@@ -357,47 +374,23 @@ class MultiReflectionTiming(nn.Module):
         torch.cuda.synchronize()
         t_d0 = time.time()
         
-        #tmp_1 = e_diffuse * e_r_diffuse
-        
-        #d = 1.0/(1.0 - e_diffuse*e_r_diffuse*r_surface_diffuse + eps)
-        
         d = 1.0/(1.0 - e_r_diffuse*r_surface_diffuse + eps)
         
-        #d = torch.ones(e_r_diffuse.shape, dtype=torch.float32,
-        #                 device=self.device)
-        
-        #d = 1.0/(1.0 - tmp_1*r_surface_diffuse + eps)
         torch.cuda.synchronize()
         t_d1 = time.time()
         global t_division
         t_division += t_d1 - t_d0
 
         # Adding-Doubling for direct radiation
-        #t_multi_direct = (t_direct * r_surface_direct * e_diffuse * e_r_diffuse * d
-        #                  + e_direct * e_t_direct * d)
-        
-        #t_multi_direct = (t_direct * r_surface_direct * e_diffuse * e_r_diffuse
-        #                  + e_direct * e_t_direct) 
-        
-        #t_multi_direct = (t_direct * r_surface_direct *  e_r_diffuse
-        #                  +  e_t_direct) * d
         
         t_multi_direct = (t_direct * r_surface_direct *  e_r_diffuse
                           +  e_t_direct) / (1.0 - e_r_diffuse*r_surface_diffuse + eps)
-        
-        #t_multi_direct = (t_direct * r_surface_direct * tmp_1
-        #                  + e_direct * e_t_direct) * d
         
         torch.cuda.synchronize()
         t_d2 = time.time()
         global t_first_operation
         t_first_operation += t_d2 - t_d0
         
-
-        #a_surface_multi_direct = (t_direct * a_surface_direct
-        #                          + t_multi_direct * a_surface_diffuse)
-
-
         r_surface_multi_direct = (t_direct * r_surface_direct * d
                                   + e_t_direct * r_surface_diffuse * d)
 
@@ -468,7 +461,6 @@ class MultiReflectionTiming(nn.Module):
 
         radiative_layers, x_surface = x
 
-        #t_direct, t_diffuse, e_split_direct, e_split_diffuse = radiative_layers
         t_direct, t_diffuse, e_t_direct, e_r_direct, e_a_direct, \
                   e_t_diffuse, e_r_diffuse, e_a_diffuse = radiative_layers
 
@@ -487,11 +479,6 @@ class MultiReflectionTiming(nn.Module):
         r_surface_multi_diffuse_list = []
         a_layer_multi_direct_list = []
         a_layer_multi_diffuse_list = []
-        
-        #t_direct_p = t_direct.permute(1,0,2).clone()
-        #t_diffuse_p = t_diffuse.permute(1,0,2).clone()
-        #e_split_direct_p = e_split_direct.permute(1,3,0,2).clone()
-        #e_split_diffuse_p = e_split_diffuse.permute(1,3,0,2).clone()
 
         # Start at the original surface and move up
         # one atmospheric layer for each iteration
@@ -501,10 +488,6 @@ class MultiReflectionTiming(nn.Module):
 
             multireflected_info = self._adding_doubling(t_direct[:, i, :],
                                                         t_diffuse[:, i, :],
-                                                        #e_split_direct[:,
-                                                        #               i, :, :],
-                                                        #e_split_diffuse[:,
-                                                        #                i, :, :],
                                                         e_t_direct[:, i, :], 
                                                         e_r_direct[:, i, :], 
                                                         e_a_direct[:, i, :],
@@ -570,11 +553,30 @@ class MultiReflectionTiming(nn.Module):
 class FullNetTiming(nn.Module):
     """ 
     Same as FullNet in train_network.py except contains
-    timing code
+    timing code and slightly different output for ScatteringTiming
+    and input for MultiReflectionTiming
     
-    Computes full radiative transfer (direct and diffuse radiation)
-    for an atmospheric column 
-    
+    Propagates flux from the top of the atmosphere to the
+    surface, making a single pass through the atmospheric layers
+
+    Values for flux_direct, flux_diffuse propagate into each layer for
+    each channel: 
+                
+    Downward Direct Flux Transmitted = flux_direct * t_direct
+    Downward Diffuse Flux Transmitted = 
+                    flux_direct * t_multi_direct + 
+                    flux_diffuse * (t_diffuse + t_multi_diffuse)
+
+    Upward Flux from Top Layer = flux_direct * r_layer_multi_direct +
+                            flux_diffuse * r_layer_multi_diffuse
+
+    Upward Flux into Top Layer from below = 
+                        flux_direct * r_surface_multi_direct +
+                        flux_diffuse * r_surface_multi_diffuse
+
+    Upward fluxes are diffuse only because they are due to scattering
+    of the downward fluxes
+
     """
 
     def __init__(self, n_channel, n_constituent, dropout_p, device):
@@ -1112,7 +1114,7 @@ def evaluate_network_analysis():
     - Error on "clear sky" (clouds removed) data
     
     Also can be used to analyze various versions of trained network
-    - train_network_3 - Allowing all gases to influence every channel
+    - train_network_3 - Allows each gas to influence each channel
     - train_network_4 - Alternative inputs to scattering module
     - train_network_5 - 28 channels
     - train_network_6 - 14 channels
@@ -1434,35 +1436,37 @@ def evaluate_network_analysis():
 
 def evaluate_network():
     """
-    Evaluates accuracy of 'baseline' model on testing sets 
+    Evaluates accuracy of chosen network model on testing sets 
     from 2009, 2015, 2020
     """
     
-    # Specify model
+    # Specify model location
     model_dir = "/home/hws/src/openbox_neural_networks/shortwave_radiative_transfer/models/"
     model_name_prefix = 'openbox.shortwave.'
     
-    if tn.__name__ == 'train_network':
-        model_id = "v2."                # "Baseline" trained model
+    if tn.__name__ == 'train_network':  # "Baseline" trained model
+        model_id = "v2."                
         n_epoch = 596                   # Epoch selected by training
         n_channel = 42
-    elif tn.__name__ == 'train_network_3':
-        model_id = "v3.1."            
+    elif tn.__name__ == 'train_network_3': 
+        model_id = "v3.1."    # Allows each gas to influence each channel        
         n_epoch = 752
         n_channel = 42
     elif tn.__name__ == 'train_network_4':
-        model_id = "v4.1."            
+        model_id = "v4.1."      # Alternative inputs to scattering module      
         n_epoch = 753
         n_channel = 42
     elif tn.__name__ == 'train_network_5':
-        model_id = "v5.1."            
+        model_id = "v5.1."      # 28 channels instead of 42 
         n_epoch = 669
         n_channel = 28
     elif tn.__name__ == 'train_network_6':
-        model_id = "v6.2."            
+        model_id = "v6.2."      # 14 channels instead of 42       
         n_epoch = 655
         n_channel = 14
     elif tn.__name__ == 'train_network_7':
+        # Replaces transmissivity and scattering modules with single
+        # neural network modules for direct and diffuse radiation
         model_id = "v7.1."            
         n_epoch = 765
         n_channel = 42
@@ -1554,13 +1558,18 @@ def evaluate_network():
 
 if __name__ == "__main__":
     
-    # If False, only computes accuracy of 'baseline' model on
+    # Choose network to evaluate by importing it as "tn", 
+    # at the top of this file. For example:
+    #
+    # import training_network_5.py as tn
+    
+    # If is_analysis = False, computes accuracy of chosen network on
     # testing sets
     
-    # If True, can compute accuracy of any of the modified networks
-    # and can analyze the results in various ways.
+    # If True, analyzes the results in various ways. See 
+    # evaluate_network_analysis()
     
-    is_analysis = True            
+    is_analysis = False            
 
     if is_analysis:
         evaluate_network_analysis()
