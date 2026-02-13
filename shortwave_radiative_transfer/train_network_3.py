@@ -1215,7 +1215,7 @@ def train_network():
         model_filename_input = model_filename + str(n_start).zfill(3)
         n_start = n_start + 1
 
-    checkpoint = torch.load(model_filename_input)
+    checkpoint = torch.load(model_filename_input, weights_only=False)
     print(f"Loaded Model: {model_filename_input}")
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

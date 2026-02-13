@@ -391,7 +391,7 @@ class OpticalDepth(nn.Module):
         self.net_ke_ch4.reset_dropout(dropout_p)
         # self.net_ke_co.reset_dropout(dropout_p)
 
-    #@torch.compile
+    @torch.compile
     def forward(self, x):
         """
         Computes the optical depth for each atmospheric 
@@ -831,7 +831,7 @@ class MultiReflection(nn.Module):
                 r_surface_multi_direct, r_surface_multi_diffuse,
                 a_layer_multi_direct, a_layer_multi_diffuse,
                 a_surface_multi_direct, a_surface_multi_diffuse)
-
+    @torch.compile
     def forward(self, x):
         """
         Traverses the atmospheric layers from the surface to the 
@@ -965,6 +965,7 @@ class Propagation(nn.Module):
         super(Propagation, self).__init__()
         self.n_channel = n_channel
 
+    @torch.compile
     def forward(self, x):
 
         multireflected_layers, upward_reflection_toa, input_flux = x
@@ -1375,7 +1376,7 @@ def train_network():
         model_filename_input = model_filename + str(n_start).zfill(3)
         n_start = n_start + 1
 
-    checkpoint = torch.load(model_filename_input)
+    checkpoint = torch.load(model_filename_input, weights_only=False)
     print(f"Loaded Model: {model_filename_input}")
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

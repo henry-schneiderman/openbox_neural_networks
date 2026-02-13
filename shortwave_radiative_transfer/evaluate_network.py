@@ -1286,7 +1286,7 @@ def evaluate_network_analysis():
     
     loss_weights = tn.get_loss_weights(n_epoch)
     checkpoint = torch.load(model_filename + str(n_epoch).zfill(3),
-                            map_location=torch.device(device))
+                            map_location=torch.device(device), weights_only=False)
     print(f"Loaded Model: epoch = {n_epoch}")
     model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -1504,7 +1504,7 @@ def evaluate_network():
     model_filename = model_dir + f"{model_name_prefix}{model_id}"
     
     checkpoint = torch.load(model_filename + str(n_epoch).zfill(3),
-                            map_location=torch.device(device))
+                            map_location=torch.device(device), weights_only=False)
     print(" ")
     print(f"Model = {tn.__name__}")
     print(f"Loaded Model: epoch = {n_epoch}")
