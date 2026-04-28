@@ -1,0 +1,1428 @@
+"""
+Fast Training of Open Box Neural Network for Shortwave Radiative Transfer
+— Optimized for NVIDIA T4 GPU variant. Performance will be significantly improved for more recent GPUs, too.
+
+Optimizations over the original train_network.py:
+
+  * Custom Triton kernel for training the scattering module
+  
+  * Monthly GPU-Resident Loading: loads one month at a time to GPU
+    (training data is ~1.9M samples, too large for 16GB T4 all at once).
+    Within each month, all data is GPU-resident with on-GPU shuffling
+    via torch.randperm — zero per-batch CPU→GPU transfers.
+    Validation data (~269K samples) fits entirely on GPU.
+
+  * All computation in FP32: FP16 is not used because torch.exp() in
+    OpticalDepth overflows FP16 (max 65504), and the 32×32 matmuls in
+    MultipleMLPs are too small for T4 tensor core benefit.  The speedup
+    comes from torch.compile and GPU-resident data instead.
+
+  * torch.compile on key modules (OpticalDepth,
+    MultiReflection, Propagation): fuses operations, eliminates Python
+    overhead, enables kernel fusion across the forward pass.
+
+  * Pre-allocated MultiReflection and Propagation: eliminates Python
+    list.append, torch.stack, and torch.flip overhead by writing
+    directly into pre-allocated tensors (used in the backward path).
+
+  * Adam optimizer with foreach=True for faster parameter updates.
+
+  * Warmup pass: triggers torch.compile JIT compilation on dummy data
+    before real training begins, so epoch timings are accurate.
+
+  * State-dict compatible with the original train_network.FullNet —
+    can resume training from any existing checkpoint.
+
+Author: Henry Schneiderman, henry@pittdata.com
+Anthropic's Claude Code did the heavy lifting!
+"""
+
+import os
+import sys
+import random
+import numpy as np
+import time
+from typing import List
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+import xarray as xr
+
+import data_generation
+import network_losses as nl
+
+import fused_scattering_training_T4
+
+# Ensure Triton finds a working C compiler (the conda default may
+# point to a non-existent py38 path on some Azure VMs).
+if 'CC' not in os.environ:
+    for _cc in ['/usr/bin/gcc', '/usr/bin/cc']:
+        if os.path.isfile(_cc):
+            os.environ['CC'] = _cc
+            break
+
+torch.set_float32_matmul_precision('high')
+
+default_float_type = torch.float32
+
+# ---------------------------------------------------------------------------
+# MLP (unchanged from train_network.py — needed for OpticalDepth ke MLPs)
+# ---------------------------------------------------------------------------
+class MLP(nn.Module):
+    """
+    Multi Layer Perceptron (MLP) module
+    """
+
+    def __init__(self, n_input, n_hidden: List[int], n_output,
+                 dropout_p, device, lower=-0.1, upper=0.1, bias=True):
+        super(MLP, self).__init__()
+        self.n_hidden = n_hidden
+        self.n_outputs = n_output
+        n_last = n_input
+        self.hidden = nn.ModuleList()
+
+        for n in n_hidden:
+            mod = nn.Linear(n_last, n, bias=bias, device=device)
+            torch.nn.init.uniform_(mod.weight, a=lower, b=upper)
+            if bias:
+                torch.nn.init.uniform_(mod.bias, a=0.9, b=1.1)
+            self.hidden.append(mod)
+            n_last = n
+        self.dropout_p = dropout_p
+        self.output = nn.Linear(n_last, n_output, bias=bias, device=device)
+        torch.nn.init.uniform_(self.output.weight, a=lower, b=upper)
+        if bias:
+            torch.nn.init.uniform_(self.output.bias, a=-0.1, b=0.1)
+
+    def reset_dropout(self, dropout_p):
+        self.dropout_p = dropout_p
+
+    def forward(self, x):
+        for hidden in self.hidden:
+            x = hidden(x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+        return self.output(x)
+
+
+# ---------------------------------------------------------------------------
+# MultipleMLPs — Block-diagonal implementation optimized for T4.
+#
+# Instead of the original mask-multiply approach:
+#     x @ (filter * weight)       — wastes 75% of FLOPs on zeros
+#
+# This version splits activations into 4 independent 8-wide streams and
+# computes each with a separate matmul.  Under torch.compile + AMP, each
+# 8-wide matmul uses the T4's FP16 tensor cores.
+#
+# State-dict compatible with the original MultipleMLPs (same parameter
+# names: input_weight, input_bias, weights, biases, output_weights,
+# output_bias).
+# ---------------------------------------------------------------------------
+class MultipleMLPs(nn.Module):
+    """
+    Block-diagonal MLP: 4 independent 8-wide hidden streams.
+    State-dict compatible with original train_network.MultipleMLPs.
+    """
+
+    def __init__(self, n_input, n_hidden_layers, dropout_p, device,
+                 bias=False, requires_grad=True):
+        super(MultipleMLPs, self).__init__()
+        n_hidden_nodes = 32
+        n_output_nodes = 24
+        self.n_hidden_layers = n_hidden_layers
+        self.dropout_p = dropout_p
+
+        weight_values = torch.rand(
+            (n_input, n_hidden_nodes), requires_grad=requires_grad,
+            device=device, dtype=default_float_type)
+        self.input_weight = nn.parameter.Parameter(
+            weight_values, requires_grad=requires_grad)
+
+        self.bias = bias
+        if bias:
+            bias_values = torch.rand(
+                (n_hidden_nodes,), requires_grad=requires_grad, device=device,
+                dtype=default_float_type)
+            self.input_bias = nn.parameter.Parameter(
+                bias_values, requires_grad=requires_grad)
+            biases = []
+
+        template = torch.ones((8, 8), device=device, dtype=default_float_type)
+        self.filter = torch.block_diag(template, template, template, template)
+        weights = []
+
+        n_last = n_hidden_nodes
+        for i in range(n_hidden_layers - 1):
+            weights.append(
+                torch.rand(
+                    (n_last, n_hidden_nodes), requires_grad=requires_grad,
+                    device=device, dtype=default_float_type))
+            if bias:
+                biases.append(
+                    torch.rand(
+                        (n_hidden_nodes,), requires_grad=requires_grad,
+                        device=device, dtype=default_float_type))
+            n_last = n_hidden_nodes
+
+        self.weights = torch.nn.ParameterList(weights)
+        tmp_weights = torch.rand(
+            (n_last, n_output_nodes), requires_grad=requires_grad,
+            device=device, dtype=default_float_type)
+        self.output_weights = nn.parameter.Parameter(
+            tmp_weights, requires_grad=requires_grad)
+
+        if bias:
+            self.biases = torch.nn.ParameterList(biases)
+            weight_values = torch.rand(
+                (n_output_nodes,), requires_grad=requires_grad,
+                device=device, dtype=default_float_type)
+            self.output_bias = nn.parameter.Parameter(
+                weight_values, requires_grad=requires_grad)
+
+        template = torch.ones(
+            (4, 3), device=device, dtype=default_float_type)
+        self.output_filter = torch.block_diag(
+            template, template, template, template,
+            template, template, template, template)
+
+    def reset_dropout(self, dropout_p):
+        self.dropout_p = dropout_p
+
+    def forward(self, x):
+        if self.bias:
+            x = x @ self.input_weight + self.input_bias
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+            for i, weight in enumerate(self.weights):
+                x = x @ (self.filter * weight) + self.biases[i]
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
+            x = x @ (self.output_filter * self.output_weights) + \
+                self.output_bias
+        else:
+            x = x @ self.input_weight
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+            for weight in self.weights:
+                x = x @ (self.filter * weight)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
+            x = x @ (self.output_filter * self.output_weights)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# LayerDistributed (same as original)
+# ---------------------------------------------------------------------------
+class LayerDistributed(nn.Module):
+    """
+    Applies a nn.Module independently to an array of atmospheric layers.
+    Folds the samples and layers dimensions.
+    """
+
+    def __init__(self, module):
+        super(LayerDistributed, self).__init__()
+        self.module = module
+
+    def reset_dropout(self, dropout_p):
+        self.module.reset_dropout(dropout_p)
+
+    def forward(self, x):
+        if torch.is_tensor(x):
+            shape = x.shape
+            n_sample = shape[0]
+            n_layer = shape[1]
+            squashed_input = x.contiguous().view(n_sample * n_layer, *shape[2:])
+        else:
+            squashed_input = []
+            for xx in x:
+                shape = xx.shape
+                n_sample = shape[0]
+                n_layer = shape[1]
+                xx_reshape = xx.contiguous().view(
+                    n_sample * n_layer, *shape[2:])
+                squashed_input.append(xx_reshape)
+        y = self.module(squashed_input)
+        if torch.is_tensor(y):
+            shape = y.shape
+            unsquashed_output = y.contiguous().view(
+                n_sample, n_layer, *shape[1:])
+        else:
+            unsquashed_output = []
+            for yy in y:
+                shape = yy.shape
+                yy_reshaped = yy.contiguous().view(
+                    n_sample, n_layer, *shape[1:])
+                unsquashed_output.append(yy_reshaped)
+        return unsquashed_output
+
+
+# ---------------------------------------------------------------------------
+# OpticalDepth (same as original, with torch.compile)
+# ---------------------------------------------------------------------------
+class OpticalDepth(nn.Module):
+    """
+    Computes the optical depth for each atmospheric constituent for each
+    channel.
+    """
+
+    def __init__(self, n_channel, dropout_p, device):
+        super(OpticalDepth, self).__init__()
+        self.n_channel = n_channel
+        self.device = device
+        self.dropout_p = dropout_p
+
+        self.net_lw = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_iw = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_h2o = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_o3 = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_co2 = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_o2 = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_n2o = nn.Linear(1, self.n_channel, bias=False, device=device)
+        self.net_ch4 = nn.Linear(1, self.n_channel, bias=False, device=device)
+
+        lower = -0.9
+        upper = 0.5
+        torch.nn.init.uniform_(self.net_lw.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_iw.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_h2o.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_o3.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_co2.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_o2.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_n2o.weight, a=lower, b=upper)
+        torch.nn.init.uniform_(self.net_ch4.weight, a=lower, b=upper)
+
+        self.net_ke_h2o = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                              dropout_p=dropout_p, device=device)
+        self.net_ke_o3 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                             dropout_p=dropout_p, device=device)
+        self.net_ke_co2 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                              dropout_p=dropout_p, device=device)
+        self.net_ke_o2 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                             dropout_p=dropout_p, device=device)
+        self.net_ke_n2o = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                              dropout_p=dropout_p, device=device)
+        self.net_ke_ch4 = MLP(n_input=2, n_hidden=(6, 4, 4), n_output=1,
+                              dropout_p=dropout_p, device=device)
+
+        filter_h2o = torch.tensor(
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            dtype=default_float_type, device=device)
+        self.filter_h2o = torch.cat([filter_h2o, filter_h2o, filter_h2o])
+
+        filter_o3 = torch.tensor(
+            [1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1],
+            dtype=default_float_type, device=device)
+        self.filter_o3 = torch.cat([filter_o3, filter_o3, filter_o3])
+
+        filter_co2 = torch.tensor(
+            [1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+            dtype=default_float_type, device=device)
+        self.filter_co2 = torch.cat([filter_co2, filter_co2, filter_co2])
+
+        filter_o2 = torch.tensor(
+            [1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1],
+            dtype=default_float_type, device=device)
+        self.filter_o2 = torch.cat([filter_o2, filter_o2, filter_o2])
+
+        filter_n2o = torch.tensor(
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            dtype=default_float_type, device=device)
+        self.filter_n2o = torch.cat([filter_n2o, filter_n2o, filter_n2o])
+
+        filter_ch4 = torch.tensor(
+            [1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            dtype=default_float_type, device=device)
+        self.filter_ch4 = torch.cat([filter_ch4, filter_ch4, filter_ch4])
+
+    def reset_dropout(self, dropout_p):
+        self.dropout_p = dropout_p
+        self.net_ke_h2o.reset_dropout(dropout_p)
+        self.net_ke_o3.reset_dropout(dropout_p)
+        self.net_ke_co2.reset_dropout(dropout_p)
+        self.net_ke_o2.reset_dropout(dropout_p)
+        self.net_ke_n2o.reset_dropout(dropout_p)
+        self.net_ke_ch4.reset_dropout(dropout_p)
+
+    @torch.compile
+    def forward(self, x):
+        temperature_pressure, constituent_mass = x
+
+        m = constituent_mass
+        shape = m.shape
+        m = m.reshape((shape[0], 1, shape[1]))
+        t_p = temperature_pressure
+
+        exp = torch.exp
+        sigmoid = torch.sigmoid
+
+        one = torch.ones(
+            (shape[0], 1), dtype=default_float_type, device=self.device)
+
+        tau_lw = exp(self.net_lw(one)) * m[:, :, 0]
+        tau_iw = exp(self.net_iw(one)) * m[:, :, 1]
+
+        tau_h2o = exp(self.net_h2o(one)) * m[:, :, 2] * \
+            (sigmoid(self.net_ke_h2o(t_p)) * self.filter_h2o)
+
+        tau_o3 = exp(self.net_o3(one)) * m[:, :, 3] * \
+            (sigmoid(self.net_ke_o3(t_p)) * self.filter_o3)
+
+        tau_co2 = exp(self.net_co2(one)) * m[:, :, 4] * \
+            (sigmoid(self.net_ke_co2(t_p)) * self.filter_co2)
+
+        tau_o2 = exp(self.net_o2(one)) * m[:, :, 5] * \
+            (sigmoid(self.net_ke_o2(t_p)) * self.filter_o2)
+
+        tau_n2o = exp(self.net_n2o(one)) * m[:, :, 6] * \
+            (sigmoid(self.net_ke_n2o(t_p)) * self.filter_n2o)
+
+        tau_ch4 = exp(self.net_ch4(one)) * m[:, :, 7] * \
+            (sigmoid(self.net_ke_ch4(t_p)) * self.filter_ch4)
+
+        tau_lw = torch.unsqueeze(tau_lw, 2)
+        tau_iw = torch.unsqueeze(tau_iw, 2)
+        tau_h2o = torch.unsqueeze(tau_h2o, 2)
+        tau_o3 = torch.unsqueeze(tau_o3, 2)
+        tau_co2 = torch.unsqueeze(tau_co2, 2)
+        tau_o2 = torch.unsqueeze(tau_o2, 2)
+        tau_n2o = torch.unsqueeze(tau_n2o, 2)
+        tau_ch4 = torch.unsqueeze(tau_ch4, 2)
+
+        tau = torch.cat([tau_lw, tau_iw, tau_h2o, tau_o3, tau_co2, tau_o2,
+                         tau_n2o, tau_ch4], dim=2)
+
+        return tau
+
+
+# ---------------------------------------------------------------------------
+# Scattering (same logic, torch.compile for fusion)
+# ---------------------------------------------------------------------------
+class Scattering(nn.Module):
+    """
+    Computes scattering coefficients.  Same algorithm as original but
+    benefits from torch.compile fusing the softmax/selection operations.
+    """
+
+    def __init__(self, n_channel, n_constituent, dropout_p, device):
+        super(Scattering, self).__init__()
+        self.n_channel = n_channel
+        self.n_scattering_nets = 8
+
+        self.direct_scattering = MultipleMLPs(
+            n_input=n_constituent + 1, n_hidden_layers=3,
+            dropout_p=dropout_p, device=device, bias=True)
+
+        self.diffuse_scattering = MultipleMLPs(
+            n_input=n_constituent, n_hidden_layers=3,
+            dropout_p=dropout_p, device=device, bias=True)
+
+        self.direct_selection = nn.Conv2d(
+            in_channels=self.n_channel, out_channels=self.n_channel,
+            kernel_size=(self.n_scattering_nets, 1), stride=(1, 1),
+            padding=0, dilation=1, groups=self.n_channel, bias=False,
+            device=device)
+
+        self.diffuse_selection = nn.Conv2d(
+            in_channels=self.n_channel, out_channels=self.n_channel,
+            kernel_size=(self.n_scattering_nets, 1), stride=(1, 1),
+            padding=0, dilation=1, groups=self.n_channel, bias=False,
+            device=device)
+
+    def reset_dropout(self, dropout_p):
+        self.direct_scattering.reset_dropout(dropout_p)
+        self.diffuse_scattering.reset_dropout(dropout_p)
+        
+    def reconfigure(self, device):
+        pass
+
+    def reconfigure_selection(self):
+        """Reshape Conv2d selection weights to [1, n_channel, n_scattering_nets, 1]
+        for fast broadcast-multiply-sum, avoiding the Conv2d kernel overhead."""
+        with torch.no_grad():
+            # Conv2d weight shape: [n_channel, 1, n_scattering_nets, 1]
+            # We want: [1, n_channel, n_scattering_nets, 1]
+            self._wsel_direct = self.direct_selection.weight.detach().squeeze(1).unsqueeze(0)
+            self._wsel_diffuse = self.diffuse_selection.weight.detach().squeeze(1).unsqueeze(0)
+
+    @torch.compile
+    def forward(self, x):
+        (tau, mu_direct, mu_diffuse,) = x
+
+        tau_full_total = torch.sum(tau, dim=2, keepdims=False)
+
+        eps_1 = 0.0000001
+        t_full_direct = torch.exp(-tau_full_total / (mu_direct + eps_1))
+        t_full_diffuse = torch.exp(-tau_full_total / (mu_diffuse + eps_1))
+
+        ###### Direct Radiation ###################
+        mu_direct = torch.unsqueeze(mu_direct, dim=2)
+        tau_full_direct = tau / (mu_direct + eps_1)
+        mu_direct = mu_direct.expand(-1, self.n_channel, -1)
+        full_direct = torch.cat((tau_full_direct, mu_direct), dim=2)
+
+        e_split_full_direct = self.direct_scattering(full_direct)
+
+        n = e_split_full_direct.shape[0]
+        e_split_full_direct = torch.reshape(
+            e_split_full_direct,
+            (n, self.n_channel, self.n_scattering_nets, 3))
+        e_split_full_direct = F.softmax(e_split_full_direct, dim=-1)
+        # Selection: weighted sum over the 8 scattering nets (replaces Conv2d)
+        # wsel: [n_channel, 1, 8, 1] → [1, n_channel, 8, 1] for broadcast
+        wsel_d = self.direct_selection.weight.permute(1, 0, 2, 3)
+        e_split_full_direct = (e_split_full_direct * wsel_d).sum(dim=2, keepdim=True)
+        e_split_full_direct = e_split_full_direct.squeeze(2)
+        e_split_full_direct = F.softmax(e_split_full_direct, dim=-1)
+
+        ###### Diffuse Radiation ###################
+        e_split_full_diffuse = self.diffuse_scattering(tau)
+        n = e_split_full_diffuse.shape[0]
+        e_split_full_diffuse = torch.reshape(
+            e_split_full_diffuse,
+            (n, self.n_channel, self.n_scattering_nets, 3))
+        e_split_full_diffuse = F.softmax(e_split_full_diffuse, dim=-1)
+        wsel_dif = self.diffuse_selection.weight.permute(1, 0, 2, 3)
+        e_split_full_diffuse = (e_split_full_diffuse * wsel_dif).sum(dim=2, keepdim=True)
+        e_split_full_diffuse = e_split_full_diffuse.squeeze(2)
+        e_split_full_diffuse = F.softmax(e_split_full_diffuse, dim=-1)
+
+        layers = [t_full_direct, t_full_diffuse, e_split_full_direct,
+                  e_split_full_diffuse]
+
+        return layers
+
+
+# ---------------------------------------------------------------------------
+# MultiReflection — pre-allocated tensor version.
+# Eliminates list.append + torch.stack + torch.flip overhead.
+# ---------------------------------------------------------------------------
+class MultiReflection(nn.Module):
+    """
+    Adding-doubling multireflection — writes directly into pre-allocated
+    tensors.
+    """
+
+    def __init__(self):
+        super(MultiReflection, self).__init__()
+
+    @torch.compile
+    def forward(self, x):
+        radiative_layers, x_surface = x
+        t_direct, t_diffuse, e_split_direct, e_split_diffuse = radiative_layers
+
+        n_samples = t_direct.shape[0]
+        n_layers = t_direct.shape[1]
+        n_channels = t_direct.shape[2]
+        device = t_direct.device
+
+        # Surface coefficients
+        r_s = x_surface[:, 1:2]
+        r_surface_direct = r_s
+        r_surface_diffuse = r_s
+        a_surface_direct = 1.0 - r_s
+        a_surface_diffuse = 1.0 - r_s
+
+        # Pre-allocate output tensors
+        t_multi_direct_out = torch.empty(
+            n_samples, n_layers, n_channels, device=device)
+        t_multi_diffuse_out = torch.empty_like(t_multi_direct_out)
+        r_surface_multi_direct_out = torch.empty_like(t_multi_direct_out)
+        r_surface_multi_diffuse_out = torch.empty_like(t_multi_direct_out)
+        a_layer_multi_direct_out = torch.empty_like(t_multi_direct_out)
+        a_layer_multi_diffuse_out = torch.empty_like(t_multi_direct_out)
+
+        # Bottom-up traversal
+        for j in range(n_layers):
+            i = n_layers - 1 - j
+
+            td = t_direct[:, i, :]
+            tdf = t_diffuse[:, i, :]
+            e_split_d = e_split_direct[:, i, :, :]
+            e_split_f = e_split_diffuse[:, i, :, :]
+
+            e_direct = 1.0 - td
+            e_diffuse = 1.0 - tdf
+
+            e_t_direct = e_split_d[:, :, 0]
+            e_r_direct = e_split_d[:, :, 1]
+            e_a_direct = e_split_d[:, :, 2]
+            e_t_diffuse = e_split_f[:, :, 0]
+            e_r_diffuse = e_split_f[:, :, 1]
+            e_a_diffuse = e_split_f[:, :, 2]
+
+            eps = 1.0e-06
+            d = 1.0 / (1.0 - e_diffuse * e_r_diffuse * r_surface_diffuse
+                       + eps)
+
+            # Direct
+            t_multi_direct = (
+                td * r_surface_direct * e_diffuse * e_r_diffuse * d
+                + e_direct * e_t_direct * d)
+            r_surface_multi_direct = (
+                td * r_surface_direct * d
+                + e_direct * e_t_direct * r_surface_diffuse * d)
+            a_layer_multi_direct = (
+                e_direct * e_a_direct
+                + r_surface_multi_direct * e_diffuse * e_a_diffuse)
+            r_layer_multi_direct = (
+                e_direct * e_r_direct
+                + r_surface_multi_direct
+                * (tdf + e_diffuse * e_t_diffuse))
+            a_surface_multi_direct = (
+                td * a_surface_direct
+                + t_multi_direct * a_surface_diffuse)
+
+            # Diffuse
+            t_multi_diffuse = (
+                tdf * r_surface_diffuse * e_diffuse * e_r_diffuse * d
+                + e_diffuse * e_t_diffuse * d)
+            r_surface_multi_diffuse = (
+                tdf * r_surface_diffuse * d
+                + e_diffuse * e_t_diffuse * r_surface_diffuse * d)
+            a_layer_multi_diffuse = (
+                e_diffuse * e_a_diffuse
+                + r_surface_multi_diffuse * e_diffuse * e_a_diffuse)
+            r_layer_multi_diffuse = (
+                e_diffuse * e_r_diffuse
+                + r_surface_multi_diffuse
+                * (tdf + e_diffuse * e_t_diffuse))
+            a_surface_multi_diffuse = (
+                tdf * a_surface_diffuse
+                + t_multi_diffuse * a_surface_diffuse)
+
+            # Store results (top layer = index 0, so write at n_layers-1-j = i)
+            t_multi_direct_out[:, i, :] = t_multi_direct
+            t_multi_diffuse_out[:, i, :] = t_multi_diffuse
+            r_surface_multi_direct_out[:, i, :] = r_surface_multi_direct
+            r_surface_multi_diffuse_out[:, i, :] = r_surface_multi_diffuse
+            a_layer_multi_direct_out[:, i, :] = a_layer_multi_direct
+            a_layer_multi_diffuse_out[:, i, :] = a_layer_multi_diffuse
+
+            # Merge layer into virtual surface for next iteration
+            r_surface_direct = r_layer_multi_direct
+            r_surface_diffuse = r_layer_multi_diffuse
+            a_surface_direct = a_layer_multi_direct + a_surface_multi_direct
+            a_surface_diffuse = (a_layer_multi_diffuse
+                                 + a_surface_multi_diffuse)
+
+        # r_layer_multi_direct at end = upward_reflection_toa
+        upward_reflection_toa = r_layer_multi_direct
+
+        multireflected_layers = [
+            t_direct, t_diffuse,
+            t_multi_direct_out, t_multi_diffuse_out,
+            r_surface_multi_direct_out, r_surface_multi_diffuse_out,
+            a_layer_multi_direct_out, a_layer_multi_diffuse_out]
+
+        return (multireflected_layers, upward_reflection_toa)
+
+
+# ---------------------------------------------------------------------------
+# Propagation — pre-allocated tensor version.
+# ---------------------------------------------------------------------------
+class Propagation(nn.Module):
+    """
+    Propagates flux from TOA to surface.  Pre-allocates output tensors
+    and writes in-place to avoid list/stack overhead.
+    """
+
+    def __init__(self, n_channel):
+        super(Propagation, self).__init__()
+        self.n_channel = n_channel
+
+    @torch.compile
+    def forward(self, x):
+        multireflected_layers, upward_reflection_toa, input_flux = x
+
+        (t_direct, t_diffuse,
+         t_multi_direct, t_multi_diffuse,
+         r_surface_multi_direct, r_surface_multi_diffuse,
+         a_layer_multi_direct, a_layer_multi_diffuse) = multireflected_layers
+
+        flux_direct, flux_diffuse = input_flux
+
+        n_samples = t_direct.shape[0]
+        n_layers = t_direct.shape[1]
+        device = t_direct.device
+
+        # Pre-allocate outputs
+        flux_down_direct = torch.empty(
+            n_samples, n_layers + 1, device=device)
+        flux_down_diffuse = torch.empty_like(flux_down_direct)
+        flux_up_diffuse = torch.empty_like(flux_down_direct)
+        flux_absorbed = torch.empty(
+            n_samples, n_layers, device=device)
+
+        # Layer 0 (TOA)
+        flux_down_direct[:, 0] = torch.sum(flux_direct, dim=-1)
+        flux_down_diffuse[:, 0] = torch.sum(flux_diffuse, dim=-1)
+        flux_up_diffuse[:, 0] = torch.sum(
+            flux_direct * upward_reflection_toa, dim=-1)
+
+        # Top-down propagation
+        for i in range(n_layers):
+            flux_absorbed[:, i] = torch.sum(
+                flux_direct * a_layer_multi_direct[:, i]
+                + flux_diffuse * a_layer_multi_diffuse[:, i], dim=-1)
+
+            new_fdd = flux_direct * t_direct[:, i]
+            new_fddf = (flux_direct * t_multi_direct[:, i]
+                        + flux_diffuse * (t_diffuse[:, i]
+                                          + t_multi_diffuse[:, i]))
+
+            flux_up_diffuse[:, i + 1] = torch.sum(
+                flux_direct * r_surface_multi_direct[:, i]
+                + flux_diffuse * r_surface_multi_diffuse[:, i], dim=-1)
+
+            flux_direct = new_fdd
+            flux_diffuse = new_fddf
+
+            flux_down_direct[:, i + 1] = torch.sum(flux_direct, dim=-1)
+            flux_down_diffuse[:, i + 1] = torch.sum(flux_diffuse, dim=-1)
+
+        return [flux_down_direct, flux_down_diffuse, flux_up_diffuse,
+                flux_absorbed]
+
+
+# ---------------------------------------------------------------------------
+# FullNet — top-level model (state-dict compatible with train_network.FullNet)
+# ---------------------------------------------------------------------------
+class FullNet(nn.Module):
+    """
+    Top level class for the neural network.
+    State-dict compatible with the original train_network.FullNet.
+    """
+
+    def __init__(self, n_channel, n_constituent, dropout_p, device):
+        super(FullNet, self).__init__()
+        self.device = device
+        self.n_channel = n_channel
+        self.solar_constant = 1361.0
+
+        self.mu_diffuse_net = nn.Linear(1, 1, bias=False, device=device)
+        torch.nn.init.uniform_(self.mu_diffuse_net.weight, a=0.4, b=0.6)
+
+        self.spectral_net = nn.Linear(
+            1, n_channel, bias=False, device=device)
+        torch.nn.init.uniform_(self.spectral_net.weight, a=0.4, b=0.6)
+
+        self.optical_depth_net = LayerDistributed(
+            OpticalDepth(n_channel, dropout_p, device))
+
+        # The original Scattering Module initially holds the 
+        # network weights but is not used for computation
+        self.scattering_net = LayerDistributed(
+            Scattering(n_channel, n_constituent, dropout_p, device))
+
+        # Use compiled PyTorch for multireflection + propagation.
+        # torch.compile handles both forward AND backward efficiently —
+        # a custom autograd with Triton forward + uncompiled backward
+        # is actually slower because the backward dominates.
+        self.multireflection_net = MultiReflection()
+        self.propagation_net = Propagation(n_channel)
+
+    def reset_dropout(self, dropout_p):
+        self.optical_depth_net.reset_dropout(dropout_p)
+        self.scattering_net.reset_dropout(dropout_p)
+
+    def forward(self, x):
+        x_layers, x_surface, _, _, _ = x
+
+        (temperature_pressure, constituent_mass) = (
+            x_layers[:, :, 0:2], x_layers[:, :, 2:10])
+
+        mu_direct = x_surface[:, 0]
+
+        one = torch.ones(
+            (1,), dtype=default_float_type, device=self.device)
+
+        mu_diffuse = torch.sigmoid(self.mu_diffuse_net(one))
+
+        tau = self.optical_depth_net(
+            (temperature_pressure, constituent_mass))
+
+        # Training: use fused Triton forward + backward kernels
+        n_samples = x_layers.shape[0]
+        n_layers = x_layers.shape[1]
+        n_ch = self.n_channel
+
+        # Flatten tau from [n_samples, n_layers, n_ch, 8]
+        # to [n_samples*n_layers, n_ch, 8]
+        tau_flat = tau.reshape(n_samples * n_layers, n_ch, 8)
+        # Flatten mu_direct from [n_samples] → repeat for each layer
+        mu_flat = mu_direct.unsqueeze(1).expand(
+            -1, n_layers).reshape(n_samples * n_layers).contiguous()
+
+        inv_mu_dif = 1.0 / (mu_diffuse + 1e-7)
+        B_total = n_samples * n_layers * n_ch
+
+        sc = self.scattering_net.module
+        dir_sc = sc.direct_scattering
+        dif_sc = sc.diffuse_scattering
+
+        # Call the fused autograd function — passes all learnable
+        # parameters explicitly so autograd tracks them.
+        (t_dir_flat, e_dir_flat,
+            t_dif_flat, e_dif_flat) = fused_scattering_training_T4._FusedScatteringFunction.apply(
+            tau_flat, mu_flat, inv_mu_dif, n_ch, B_total,
+            # Direct MLP params
+            dir_sc.input_weight, dir_sc.input_bias,
+            dir_sc.weights[0], dir_sc.biases[0],
+            dir_sc.weights[1], dir_sc.biases[1],
+            dir_sc.output_weights, dir_sc.output_bias,
+            dir_sc.filter, dir_sc.output_filter,
+            sc.direct_selection.weight,
+            # Diffuse MLP params
+            dif_sc.input_weight, dif_sc.input_bias,
+            dif_sc.weights[0], dif_sc.biases[0],
+            dif_sc.weights[1], dif_sc.biases[1],
+            dif_sc.output_weights, dif_sc.output_bias,
+            dif_sc.filter, dif_sc.output_filter,
+            sc.diffuse_selection.weight,
+        )
+
+        # Reshape to [n_samples, n_layers, n_ch, ...]
+        layers = [
+            t_dir_flat.view(n_samples, n_layers, n_ch),
+            t_dif_flat.view(n_samples, n_layers, n_ch),
+            e_dir_flat.view(n_samples, n_layers, n_ch, 3),
+            e_dif_flat.view(n_samples, n_layers, n_ch, 3),
+        ]
+
+        flux_direct = F.softmax(self.spectral_net(one), dim=-1) \
+            * self.solar_constant
+        flux_direct = torch.unsqueeze(
+            flux_direct, dim=0) * mu_direct.reshape((-1, 1))
+
+        flux_diffuse = torch.zeros(
+            (mu_direct.shape[0], self.n_channel),
+            dtype=default_float_type, device=self.device)
+
+        (multireflected_layers,
+         upward_reflection_toa) = self.multireflection_net(
+            (layers, x_surface,))
+
+        input_flux = [flux_direct, flux_diffuse]
+        flux = self.propagation_net(
+            (multireflected_layers, upward_reflection_toa, input_flux))
+
+        (flux_down_direct, flux_down_diffuse, flux_up_diffuse,
+         flux_absorbed) = flux
+
+        return [flux_down_direct, flux_down_diffuse, flux_up_diffuse,
+                flux_absorbed]
+
+
+# ---------------------------------------------------------------------------
+# GPU-Resident Dataset (adapted from evaluate_network_fast_v3_T4.py)
+# ---------------------------------------------------------------------------
+class GPUResidentDataset:
+    """All-in-memory GPU-resident dataset.
+
+    Loads each month's netCDF via data_generation.load_data, concatenates
+    along the sample axis, and uploads to GPU once.  Supports shuffling
+    via random permutation indices.
+    """
+
+    def __init__(self, input_files, is_clear_sky, device,
+                 default_float_type=torch.float32):
+        x_layers_chunks = []
+        x_surface_chunks = []
+        delta_pressure_chunks = []
+        y_chunks = []
+        sites_chunks = []
+
+        for file_index, path in enumerate(input_files):
+            ds = xr.open_dataset(path)
+            try:
+                x_layers, x_surface, delta_pressure, y, sites = \
+                    data_generation.load_data(
+                        ds, file_index, is_clear_sky=is_clear_sky,
+                        default_float_type=default_float_type)
+            finally:
+                ds.close()
+            x_layers_chunks.append(x_layers)
+            x_surface_chunks.append(x_surface)
+            delta_pressure_chunks.append(delta_pressure)
+            y_chunks.append(y)
+            sites_chunks.append(sites)
+
+        self.x_layers = torch.cat(
+            x_layers_chunks, dim=0).to(device, non_blocking=True)
+        self.x_surface = torch.cat(
+            x_surface_chunks, dim=0).to(device, non_blocking=True)
+        self.delta_pressure = torch.cat(
+            delta_pressure_chunks, dim=0).to(device, non_blocking=True)
+        self.y = torch.cat(
+            y_chunks, dim=0).to(device, non_blocking=True)
+        self.sites = torch.cat(
+            sites_chunks, dim=0).to(device, non_blocking=True)
+
+        self.n = self.x_layers.shape[0]
+        torch.cuda.synchronize()
+
+    def __len__(self):
+        return self.n
+
+    def free(self):
+        del self.x_layers, self.x_surface, self.delta_pressure
+        del self.y, self.sites
+        torch.cuda.empty_cache()
+
+
+class GPUShuffledDataLoader:
+    """GPU-resident batched dataloader with per-epoch shuffling.
+
+    Instead of using a CPU DataLoader with workers, generates a random
+    permutation on the GPU each epoch and yields batches as index-gathered
+    slices.  Zero host I/O on the per-batch path.
+    """
+
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self._perm = None
+
+    def __len__(self):
+        return (self.dataset.n + self.batch_size - 1) // self.batch_size
+
+    def reshuffle(self):
+        """Generate a new random permutation for the next epoch."""
+        if self.shuffle:
+            self._perm = torch.randperm(
+                self.dataset.n, device=self.dataset.x_layers.device)
+        else:
+            self._perm = None
+
+    def __iter__(self):
+        ds = self.dataset
+        bs = self.batch_size
+        n = ds.n
+        perm = self._perm
+
+        for start in range(0, n, bs):
+            end = min(start + bs, n)
+            if perm is not None:
+                idx = perm[start:end]
+                data = (ds.x_layers[idx],
+                        ds.x_surface[idx],
+                        ds.delta_pressure[idx],
+                        ds.y[idx],
+                        ds.sites[idx])
+            else:
+                data = (ds.x_layers[start:end],
+                        ds.x_surface[start:end],
+                        ds.delta_pressure[start:end],
+                        ds.y[start:end],
+                        ds.sites[start:end])
+            yield data
+
+
+# ---------------------------------------------------------------------------
+# Training loop with AMP
+# ---------------------------------------------------------------------------
+def train_loop_fast(dataloader, model, optimizer, loss_function,
+                    loss_weights, device):
+    """Training loop — all FP32, speed from torch.compile + GPU-resident data.
+
+    FP16 is not used because:
+      - OpticalDepth uses torch.exp() which overflows FP16 for weights > 11
+      - Scattering MLP inputs (tau/mu) exceed 65504 at low sun angles
+      - The 32x32 matmuls in MultipleMLPs are too small for tensor core benefit
+    The speedup instead comes primarily from a custom Triton kernel for the
+    Scattering, plus GPU-resident data loading.
+    """
+    model.train()
+
+    # Reshuffle (only for GPUShuffledDataLoader; MonthlyGPUDataLoader
+    # shuffles internally in __iter__)
+    if hasattr(dataloader, 'reshuffle'):
+        dataloader.reshuffle()
+
+    for data in dataloader:
+        # Data is already on GPU — no transfer needed.
+        y_pred = model(data)
+        loss = loss_function(data, y_pred, loss_weights)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+
+# ---------------------------------------------------------------------------
+# Test/validation loop (fast, GPU-resident)
+# ---------------------------------------------------------------------------
+def test_loop_fast(dataloader, model, loss_functions, loss_names,
+                   loss_weights, device):
+    """Validation loop."""
+    model.eval()
+    num_batches = len(dataloader)
+    n_loss = len(loss_functions)
+    loss_acc = torch.zeros(n_loss, device=device, dtype=torch.float32)
+
+    with torch.inference_mode():
+        for data in dataloader:
+            y_pred = model(data)
+            for i, loss_fn in enumerate(loss_functions):
+                loss_acc[i] += loss_fn(data, y_pred, loss_weights)
+
+    loss = (loss_acc / num_batches).cpu().numpy()
+
+    print("Test Error:")
+    for i, value in enumerate(loss):
+        print(f" {loss_names[i]}: {value:.4f}")
+    print("")
+
+    return loss
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameters (same as original)
+# ---------------------------------------------------------------------------
+def get_loss_weights(n):
+    """Weight schedule for the open box loss function."""
+    if n <= 200:
+        loss_weights = [2.0, 1.0, 0.5, 0.25]
+    elif n <= 285:
+        loss_weights = [1.0, 1.0, 0.5, 0.5]
+    elif n <= 360:
+        loss_weights = [1.0, 1.0, 1.0, 1.0]
+    elif n <= 515:
+        loss_weights = [1.0, 1.0, 2.0, 2.0]
+    elif n <= 685:
+        loss_weights = [1.0, 1.0, 0.5, 0.5]
+    else:
+        loss_weights = [1.0, 2.0, 0.5, 0.5]
+    return loss_weights
+
+def get_meta_parameters(n):
+    loss_weights = get_loss_weights(n)
+    if n <= 400:
+        lr = 0.001
+        batch_size = 1024
+    else:
+        if n % 120 <= 60:
+            batch_size = 1024
+            if n % 60 <= 20:
+                lr = 0.001
+            elif n % 60 <= 40:
+                lr = 0.0005
+            else:
+                lr = 0.00025
+        else:
+            batch_size = 512
+            if n % 60 <= 20:
+                lr = 0.0005
+            elif n % 60 <= 40:
+                lr = 0.00025
+            else:
+                lr = 0.000125
+
+    return loss_weights, lr, batch_size
+
+def get_dropout(n, n_epochs):
+    dropout_schedule = (0.0, 0.07, 0.1, 0.15, 0.2, 0.15, 0.1, 0.07, 0.0, 0.0)
+    dropout_epochs = (-1, 40, 60, 70, 80, 90, 105, 120, 135, n_epochs + 1)
+    dropout_index = next(
+        i for i, epoch in enumerate(dropout_epochs) if n <= epoch) - 1
+    dropout_p = dropout_schedule[dropout_index]
+    return dropout_p
+
+
+# ---------------------------------------------------------------------------
+# Warmup: trigger torch.compile compilation before real training
+# ---------------------------------------------------------------------------
+def _warmup(model, device, n_channel, batch_size):
+    """Run a few dummy forward+backward passes to trigger torch.compile JIT.
+
+    This moves the multi-minute compilation cost out of the first real
+    training epoch so that timing measurements are accurate.
+    """
+    print("Warming up torch.compile (this takes a few minutes)...")
+    model.train()
+    n_layers = 60
+    n_warmup_batches = 3
+    dummy_opt = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    for i in range(n_warmup_batches):
+        x_layers = torch.randn(
+            batch_size, n_layers, 10, device=device)
+        # Ensure mass values are positive (realistic)
+        x_layers[:, :, 2:10] = x_layers[:, :, 2:10].abs() * 0.01
+        x_surface = torch.rand(batch_size, 2, device=device)
+        x_surface[:, 0] = x_surface[:, 0] * 0.9 + 0.1  # mu_direct > 0
+        delta_pressure = torch.rand(
+            batch_size, n_layers, device=device) * 100
+        y = torch.randn(batch_size, n_layers + 1, 4, device=device)
+        sites = torch.zeros(batch_size, 1, device=device, dtype=torch.long)
+        data = [x_layers, x_surface, delta_pressure, y, sites]
+
+        y_pred = model(data)
+        loss = sum(p.sum() for p in y_pred)
+
+        loss.backward()
+        dummy_opt.step()
+        model.zero_grad(set_to_none=True)
+
+        if i == 0:
+            print("  First compilation pass done.")
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    print("Warmup complete.")
+
+
+# ---------------------------------------------------------------------------
+# Monthly GPU-Resident Dataset for training (loads one month at a time)
+# ---------------------------------------------------------------------------
+class MonthlyGPUDataLoader:
+    """Loads training data one month at a time to avoid OOM.
+
+    Each epoch iterates over all 12 months.  Within each month, the data
+    is uploaded to GPU once, shuffled on-GPU via randperm, and yielded in
+    batches.  After all batches of a month are consumed, that month's
+    GPU memory is freed before loading the next month.
+
+    This uses ~1/12 the GPU memory of loading all months at once, while
+    still avoiding per-batch CPU→GPU transfers (each month's data lives
+    entirely on GPU while being consumed).
+    """
+
+    def __init__(self, input_files, is_clear_sky, device, batch_size,
+                 shuffle=True):
+        self.input_files = input_files
+        self.is_clear_sky = is_clear_sky
+        self.device = device
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self._num_batches = None  # computed on first iteration
+        
+    def set_batch_size(self, batch_size):
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        """Yields batches across all months, one month on GPU at a time."""
+        # Shuffle month order each epoch
+        month_indices = list(range(len(self.input_files)))
+        if self.shuffle:
+            random.shuffle(month_indices)
+
+        for file_idx in month_indices:
+            path = self.input_files[file_idx]
+            ds = xr.open_dataset(path)
+            try:
+                x_layers, x_surface, delta_pressure, y, sites = \
+                    data_generation.load_data(
+                        ds, file_idx, is_clear_sky=self.is_clear_sky,
+                        default_float_type=default_float_type)
+            finally:
+                ds.close()
+
+            # Upload to GPU
+            x_layers = x_layers.to(self.device, non_blocking=True)
+            x_surface = x_surface.to(self.device, non_blocking=True)
+            delta_pressure = delta_pressure.to(
+                self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+            sites = sites.to(self.device, non_blocking=True)
+            torch.cuda.synchronize()
+
+            n = x_layers.shape[0]
+
+            # Shuffle within month
+            if self.shuffle:
+                perm = torch.randperm(n, device=self.device)
+            else:
+                perm = None
+
+            # Yield batches
+            for start in range(0, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                if perm is not None:
+                    idx = perm[start:end]
+                    data = (x_layers[idx], x_surface[idx],
+                            delta_pressure[idx], y[idx], sites[idx])
+                else:
+                    data = (x_layers[start:end], x_surface[start:end],
+                            delta_pressure[start:end], y[start:end],
+                            sites[start:end])
+                yield data
+
+            # Free this month's GPU memory before loading next
+            del x_layers, x_surface, delta_pressure, y, sites, perm
+            torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Main training function
+# ---------------------------------------------------------------------------
+def train_network(data_prefix, model_dir):
+    """
+    Fast training entry point for T4 GPU.
+
+    Key differences from the original:
+      - Custom Triton kernel for Scattering
+      - AMP (FP16) for T4 tensor core utilization
+      - Monthly GPU-resident loading (one month at a time for training)
+      - Validation data fully GPU-resident (small enough to fit)
+      - Warmup pass to pre-compile before timing
+    """
+    print("Pytorch version:", torch.__version__)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device} device")
+
+    if torch.cuda.is_available():
+        print('__CUDNN VERSION:', torch.backends.cudnn.version())
+        print('__Number CUDA Devices:', torch.cuda.device_count())
+        print('__CUDA Device Name:', torch.cuda.get_device_name(0))
+        print('__CUDA Device Total Memory [GB]:',
+              torch.cuda.get_device_properties(0).total_memory / 1e9)
+        print(f'Device capability = {torch.cuda.get_device_capability()}')
+
+    torch.backends.cudnn.benchmark = True
+
+    ########################
+    # Settings
+    n_start = 510 #470 #420 #270
+    n_initial_models = 4
+    n_best = n_start
+
+    model_id = "v2.4."
+    model_id = "v2.5."  # starting at 760 from v2.4
+    model_id = "v2.6."  # start from scratch
+    model_id = "v2.7."  # starting at 160 from v2.4
+    model_id = "v2.8."  # starting at 420 from v2.4
+    ############################
+
+    # Batch size: 2048 uses ~7.5 GB (of 16 GB available on T4).
+    # Larger than original (1024) for better GPU utilization.
+    #batch_size = 2048
+    #lr = 0.004 # 2x twice of lr for batch size = 1024
+    
+    batch_size = 1024
+    lr = 0.001 
+    #lr = 0.0003 # starting at 685
+    
+    #batch_size = 512 #starting at 760
+    #lr = 0.001 # 
+    #lr = 0.0005 # starting at 760
+
+    n_epochs = 2000
+    n_windup = 200
+    n_stop_training = 50
+    checkpoint_period = 10
+
+    model_name_prefix = 'openbox.shortwave.'
+    model_filename = model_dir + f"{model_name_prefix}{model_id}"
+
+    train_input_dir = f"{data_prefix}training/2008/"
+    validation_input_dir = f"{data_prefix}validation/2008/"
+    months = [str(m).zfill(2) for m in range(1, 13)]
+    train_input_files = [
+        f'{train_input_dir}shortwave-training-2008-{month}.nc'
+        for month in months]
+    validation_input_files = [
+        f'{validation_input_dir}shortwave-validation-2008-{month}.nc'
+        for month in months]
+
+    ##################################
+    n_channel = 42
+    n_constituent = 8
+    ##################
+
+    best_loss = 1.0e+08
+    n_elapsed_best = 0
+
+    # Load validation data to GPU (small enough: ~269K samples ≈ 1 GB)
+    print("Loading validation dataset to GPU...")
+    t_load_start = time.time()
+    validation_dataset = GPUResidentDataset(
+        validation_input_files, is_clear_sky=False, device=device)
+    print(f"  {len(validation_dataset)} samples loaded in "
+          f"{time.time() - t_load_start:.2f} s")
+
+    validation_dataloader = GPUShuffledDataLoader(
+        validation_dataset, batch_size, shuffle=False)
+
+    # Training data: monthly loading (one month on GPU at a time)
+    train_dataloader = MonthlyGPUDataLoader(
+        train_input_files, is_clear_sky=False, device=device,
+        batch_size=batch_size, shuffle=True)
+
+    # Loss functions
+    loss_functions = (
+        nl.openbox_rmse, nl.flux_rmse, nl.heating_rate_rmse,
+        nl.direct_flux_rmse,
+        nl.diffuse_flux_rmse, nl.flux_bias,
+        nl.direct_extinction_rmse,
+        nl.diffuse_heating_rate_rmse)
+
+    loss_names = (
+        "Openbox RMSE", "Flux RMSE", "Heating Rate RMSE",
+        "Direct Flux RMSE",
+        "Diffuse Flux RMSE", "Flux Bias",
+        "Direct Extinction RMSE",
+        "Diffuse Heating Rate RMSE")
+
+    dropout_p = 0.0
+    last_dropout_p = 0.0
+
+    model = FullNet(
+        n_channel, n_constituent, dropout_p, device).to(device=device)
+
+    # Fused Adam for faster parameter updates
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=lr, foreach=True)
+
+    # Warmup: trigger torch.compile before real training
+    _warmup(model, device, n_channel, batch_size)
+
+    # Re-create model/optimizer fresh after warmup (warmup may have
+    # corrupted weights with dummy data)
+    model = FullNet(
+        n_channel, n_constituent, dropout_p, device).to(device=device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=lr, foreach=True)
+
+    if n_start == 0:
+        n_start = 1
+        for n in range(n_initial_models):
+            print(f"Epoch = 1, Initial model = {n}")
+            model = FullNet(
+                n_channel, n_constituent, dropout_p, device).to(device=device)
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=lr, foreach=True)
+
+            loss_weights, lr, batch_size = get_meta_parameters(1)
+            
+            train_dataloader.set_batch_size(batch_size)
+            for g in optimizer.param_groups:
+                g['lr'] = lr
+
+            train_loop_fast(train_dataloader, model, optimizer,
+                            nl.openbox_rmse, loss_weights, device)
+
+            loss = test_loop_fast(validation_dataloader, model,
+                                  loss_functions, loss_names,
+                                  loss_weights, device)
+
+            if loss[0] < best_loss:
+                best_loss = loss[0]
+                n_best = n
+                torch.save({
+                    'epoch': 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss,
+                }, model_filename + 'i' + str(n).zfill(2))
+                print(f' Wrote Initial Model: {n}')
+
+    if n_start == 1:
+        model_filename_input = f'{model_filename}i' + str(n_best).zfill(2)
+    else:
+        model_filename_input = model_filename + str(n_start).zfill(3)
+        n_start = n_start + 1
+
+    checkpoint = torch.load(model_filename_input, weights_only=False)
+    print(f"Loaded Model: {model_filename_input}")
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    last_loss_weights = []
+    n_best = n_start
+
+    for n in range(n_start, n_epochs):
+        t_epoch_start = time.time()
+        print(f"Epoch = {n}")
+
+        loss_weights, lr, batch_size = get_meta_parameters(n)
+        train_dataloader.set_batch_size(batch_size)
+        for g in optimizer.param_groups:
+            g['lr'] = lr
+
+        if loss_weights != last_loss_weights:
+            last_loss_weights = loss_weights
+            print(f"New loss weights = {loss_weights}")
+            n_best = n
+            best_loss = 1.0e+08
+            n_elapsed_best = 0
+        if n % 20 == 1:
+            print(f"Batch Size = {batch_size}")
+            print(f"lr = {lr}")
+        dropout_p = get_dropout(n, n_epochs)
+        if dropout_p != last_dropout_p:
+            last_dropout_p = dropout_p
+            model.reset_dropout(dropout_p)
+            print(f"New dropout: {dropout_p}")
+
+        train_loop_fast(train_dataloader, model, optimizer,
+                        nl.openbox_rmse, loss_weights, device)
+
+        loss = test_loop_fast(validation_dataloader, model,
+                              loss_functions, loss_names, loss_weights, device)
+
+        t_epoch = time.time() - t_epoch_start
+        print(f"  Epoch time: {t_epoch:.2f} s")
+
+        is_write_model = False
+        if n % checkpoint_period == 0:
+            is_write_model = True
+
+        if loss[0] < best_loss:
+            best_loss = loss[0]
+            if n - n_best > n_elapsed_best:
+                n_elapsed_best = n - n_best
+            print(f"Epoch {n}, Improved Loss = {loss[0]:.4f}")
+            print(f"Elapsed epochs: current = {n - n_best} "
+                  f"max = {n_elapsed_best}")
+            n_best = n
+            if n > n_windup:
+                is_write_model = True
+
+        if is_write_model:
+            torch.save({
+                'epoch': n,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': loss,
+            }, model_filename + str(n).zfill(3))
+            print(f' Wrote Model: epoch = {n}')
+
+        if n - n_best >= n_stop_training and n > n_windup:
+            n_elapsed_best = n - n_best
+            print(f"Max elapsed = {n_elapsed_best}")
+            print(f"Reached n_stop_training = {n_stop_training}")
+            torch.save({
+                'epoch': n,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': loss,
+            }, model_filename + str(n).zfill(3))
+            print(f' Wrote Model: epoch = {n}')
+            break
+
+    print("Done!")
+
+
+if __name__ == "__main__":
+
+    if len(sys.argv) == 2:
+        if sys.argv[1] == "azure":
+            model_dir = "/data-T1/hws/models/"
+            data_prefix = "/data-T1/hws/CAMS/processed_data/"
+        elif sys.argv[1] == "google":
+            data_prefix = ("/mnt/disks/data-t1/atmospheric_data/"
+                           "CAMS/processed_data/")
+            model_dir = "/mnt/disks/data-t1/models/"
+        else:
+            print(f"Unknown argument {sys.argv[1]}")
+            print("Usage: python train_network_fast_T4.py [azure|google]")
+            quit()
+    else:
+        print("Usage: python train_network_fast_T4.py [azure|google]")
+        quit()
+
+    train_network(model_dir=model_dir, data_prefix=data_prefix)

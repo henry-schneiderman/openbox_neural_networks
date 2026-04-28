@@ -1,0 +1,1189 @@
+"""
+Fused Triton kernels for TRAINING the scattering MLP — T4 variant.
+
+Provides forward and backward kernels that replace the PyTorch
+Scattering + MultipleMLPs modules.  The forward kernel is a training
+variant of the inference kernel (outputs t_full and softmax fractions
+separately instead of the combined product).  The backward kernel
+recomputes the forward in registers to avoid storing 3+ GB of
+intermediate activations, then backpropagates through the chain
+(softmax → selection → group softmax → MLP layers → tau).
+
+Weight gradients are accumulated via tl.atomic_add — the 16 KB of
+gradient accumulators fits entirely in T4 L2 cache, so contention is
+minimal.
+
+Author: Henry Schneiderman, henry@pittdata.com
+Anthropic's Claude Code did the heavy lifting!
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# ──────────────────────────────────────────────────────────────────────
+# FORWARD kernel (training variant) — direct radiation
+# ──────────────────────────────────────────────────────────────────────
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_B': 64},  num_warps=2),
+        triton.Config({'BLOCK_B': 128}, num_warps=4),
+        triton.Config({'BLOCK_B': 128}, num_warps=2),
+        triton.Config({'BLOCK_B': 256}, num_warps=4),
+    ],
+    key=['B_total'],
+)
+@triton.jit
+def _scat_train_direct_fwd_kernel(
+    # Inputs
+    Tau_ptr,            # [B, n_ch, 8] FP32
+    Mu_ptr,             # [B] FP32
+    # MLP weights (BD packed)
+    W0_BD_ptr, B0_ptr,
+    WH0_BD_ptr, BH0_ptr,
+    WH1_BD_ptr, BH1_ptr,
+    WO_BD_ptr, BO_ptr,
+    Wsel_ptr,           # [n_ch, 8] FP32
+    # Outputs
+    Tfull_ptr,          # [B_total] FP32
+    Esplit_ptr,         # [B_total, 3] FP32 — softmax fractions (NOT scaled by 1-t)
+    # Sizes
+    B_total,
+    n_channels: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Forward pass for direct scattering (training variant).
+
+    Outputs t_full and the 3-way softmax fractions separately,
+    matching the training Scattering module's interface.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = offs < B_total
+
+    b_idx = offs // n_channels   # sample-layer index
+    c_idx = offs % n_channels    # channel index
+
+    c16 = tl.arange(0, 16)
+    c4 = tl.arange(0, 4)
+
+    # ── Load tau [B, n_ch, 8] → tau_pad [BLOCK_B, 16] (padded) ──
+    tau_pad = tl.load(
+        Tau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        mask=mask[:, None] & (c16[None, :] < 8), other=0.0)
+
+    tau_sum = tl.sum(tau_pad, axis=1)
+
+    mu = tl.load(Mu_ptr + b_idx, mask=mask, other=1.0)
+    inv_mu = 1.0 / (mu + 1.0e-7)
+    t_full = tl.exp(-tau_sum * inv_mu)
+
+    # MLP input: [tau/mu, mu] padded to 16
+    x_d = tau_pad * inv_mu[:, None]
+    x_d = tl.where(c16[None, :] == 8, mu[:, None], x_d)
+
+    # ── Layer 0 (FP32 IEEE, split L/R) ──
+    w0_L = tl.load(W0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    w0_R = tl.load(W0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    b0_L = tl.load(B0_ptr + c16)
+    b0_R = tl.load(B0_ptr + c16 + 16)
+    h_L = tl.dot(x_d, w0_L, input_precision="ieee") + b0_L[None, :]
+    h_R = tl.dot(x_d, w0_R, input_precision="ieee") + b0_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Hidden 0 (FP16 TC, BD) ──
+    wh0_L = tl.load(WH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh0_R = tl.load(WH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh0_L = tl.load(BH0_ptr + c16)
+    bh0_R = tl.load(BH0_ptr + c16 + 16)
+    h_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wh0_L, out_dtype=tl.float32) + bh0_L[None, :]
+    h_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wh0_R, out_dtype=tl.float32) + bh0_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Hidden 1 (FP16 TC, BD) ──
+    wh1_L = tl.load(WH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh1_R = tl.load(WH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh1_L = tl.load(BH1_ptr + c16)
+    bh1_R = tl.load(BH1_ptr + c16 + 16)
+    h_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wh1_L, out_dtype=tl.float32) + bh1_L[None, :]
+    h_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wh1_R, out_dtype=tl.float32) + bh1_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Output (FP16 TC, BD) ──
+    wo_L = tl.load(WO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wo_R = tl.load(WO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bo_L = tl.load(BO_ptr + c16)
+    bo_R = tl.load(BO_ptr + c16 + 16)
+    out_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wo_L, out_dtype=tl.float32) + bo_L[None, :]
+    out_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wo_R, out_dtype=tl.float32) + bo_R[None, :]
+
+    # ── Per-group softmax (4 groups of 4 per half) ──
+    out_gL = tl.reshape(out_L, [BLOCK_B * 4, 4])
+    m = tl.max(out_gL, axis=1)[:, None]
+    out_gL = tl.exp(out_gL - m)
+    s = tl.sum(out_gL, axis=1)[:, None]
+    out_gL = out_gL / s
+    out_basis_L = tl.reshape(out_gL, [BLOCK_B, 4, 4])
+
+    out_gR = tl.reshape(out_R, [BLOCK_B * 4, 4])
+    m = tl.max(out_gR, axis=1)[:, None]
+    out_gR = tl.exp(out_gR - m)
+    s = tl.sum(out_gR, axis=1)[:, None]
+    out_gR = out_gR / s
+    out_basis_R = tl.reshape(out_gR, [BLOCK_B, 4, 4])
+
+    # ── Selection: merge L (groups 0-3) + R (groups 4-7) ──
+    wsel_L = tl.load(Wsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                     mask=mask[:, None], other=0.0)
+    wsel_R = tl.load(Wsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                     mask=mask[:, None], other=0.0)
+    combined = (tl.sum(out_basis_L * wsel_L[:, :, None], axis=1) +
+                tl.sum(out_basis_R * wsel_R[:, :, None], axis=1))
+
+    # ── Final 3-way softmax → e_split fractions ──
+    combined_22 = tl.reshape(combined, [BLOCK_B, 2, 2])
+    T_even, T_odd = tl.split(combined_22)
+    v_t, v_a = tl.split(T_even)
+    v_r, _v_dead = tl.split(T_odd)
+
+    mx = tl.maximum(tl.maximum(v_t, v_r), v_a)
+    e_t_e = tl.exp(v_t - mx)
+    e_r_e = tl.exp(v_r - mx)
+    e_a_e = tl.exp(v_a - mx)
+    inv_s2 = 1.0 / (e_t_e + e_r_e + e_a_e)
+
+    # Store t_full and softmax fractions (NOT scaled by 1-t)
+    tl.store(Tfull_ptr + offs, t_full, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 0, e_t_e * inv_s2, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 1, e_r_e * inv_s2, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 2, e_a_e * inv_s2, mask=mask)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# FORWARD kernel (training variant) — diffuse radiation
+# ──────────────────────────────────────────────────────────────────────
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_B': 64},  num_warps=2),
+        triton.Config({'BLOCK_B': 128}, num_warps=4),
+        triton.Config({'BLOCK_B': 128}, num_warps=2),
+        triton.Config({'BLOCK_B': 256}, num_warps=4),
+    ],
+    key=['B_total'],
+)
+@triton.jit
+def _scat_train_diffuse_fwd_kernel(
+    Tau_ptr, inv_mu_diffuse,
+    W0_BD_ptr, B0_ptr,
+    WH0_BD_ptr, BH0_ptr,
+    WH1_BD_ptr, BH1_ptr,
+    WO_BD_ptr, BO_ptr,
+    Wsel_ptr,
+    Tfull_ptr, Esplit_ptr,
+    B_total,
+    n_channels: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Forward for diffuse scattering (training variant)."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = offs < B_total
+
+    b_idx = offs // n_channels
+    c_idx = offs % n_channels
+
+    c16 = tl.arange(0, 16)
+    c4 = tl.arange(0, 4)
+
+    tau_pad = tl.load(
+        Tau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        mask=mask[:, None] & (c16[None, :] < 8), other=0.0)
+
+    tau_sum = tl.sum(tau_pad, axis=1)
+    t_full = tl.exp(-tau_sum * inv_mu_diffuse)
+
+    x_d = tau_pad  # diffuse: no mu scaling, no mu append
+
+    # ── Layer 0 ──
+    w0_L = tl.load(W0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    w0_R = tl.load(W0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    b0_L = tl.load(B0_ptr + c16)
+    b0_R = tl.load(B0_ptr + c16 + 16)
+    h_L = tl.dot(x_d, w0_L, input_precision="ieee") + b0_L[None, :]
+    h_R = tl.dot(x_d, w0_R, input_precision="ieee") + b0_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Hidden 0 ──
+    wh0_L = tl.load(WH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh0_R = tl.load(WH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh0_L = tl.load(BH0_ptr + c16)
+    bh0_R = tl.load(BH0_ptr + c16 + 16)
+    h_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wh0_L, out_dtype=tl.float32) + bh0_L[None, :]
+    h_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wh0_R, out_dtype=tl.float32) + bh0_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Hidden 1 ──
+    wh1_L = tl.load(WH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh1_R = tl.load(WH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh1_L = tl.load(BH1_ptr + c16)
+    bh1_R = tl.load(BH1_ptr + c16 + 16)
+    h_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wh1_L, out_dtype=tl.float32) + bh1_L[None, :]
+    h_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wh1_R, out_dtype=tl.float32) + bh1_R[None, :]
+    h_L = tl.maximum(h_L, 0.0)
+    h_R = tl.maximum(h_R, 0.0)
+
+    # ── Output ──
+    wo_L = tl.load(WO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wo_R = tl.load(WO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bo_L = tl.load(BO_ptr + c16)
+    bo_R = tl.load(BO_ptr + c16 + 16)
+    out_L = tl.dot(tl.minimum(h_L, 65504.0).to(tl.float16), wo_L, out_dtype=tl.float32) + bo_L[None, :]
+    out_R = tl.dot(tl.minimum(h_R, 65504.0).to(tl.float16), wo_R, out_dtype=tl.float32) + bo_R[None, :]
+
+    # ── Per-group softmax ──
+    out_gL = tl.reshape(out_L, [BLOCK_B * 4, 4])
+    m = tl.max(out_gL, axis=1)[:, None]
+    out_gL = tl.exp(out_gL - m)
+    s = tl.sum(out_gL, axis=1)[:, None]
+    out_gL = out_gL / s
+    out_basis_L = tl.reshape(out_gL, [BLOCK_B, 4, 4])
+
+    out_gR = tl.reshape(out_R, [BLOCK_B * 4, 4])
+    m = tl.max(out_gR, axis=1)[:, None]
+    out_gR = tl.exp(out_gR - m)
+    s = tl.sum(out_gR, axis=1)[:, None]
+    out_gR = out_gR / s
+    out_basis_R = tl.reshape(out_gR, [BLOCK_B, 4, 4])
+
+    # ── Selection ──
+    wsel_L = tl.load(Wsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                     mask=mask[:, None], other=0.0)
+    wsel_R = tl.load(Wsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                     mask=mask[:, None], other=0.0)
+    combined = (tl.sum(out_basis_L * wsel_L[:, :, None], axis=1) +
+                tl.sum(out_basis_R * wsel_R[:, :, None], axis=1))
+
+    # ── Final 3-way softmax ──
+    combined_22 = tl.reshape(combined, [BLOCK_B, 2, 2])
+    T_even, T_odd = tl.split(combined_22)
+    v_t, v_a = tl.split(T_even)
+    v_r, _v_dead = tl.split(T_odd)
+
+    mx = tl.maximum(tl.maximum(v_t, v_r), v_a)
+    e_t_e = tl.exp(v_t - mx)
+    e_r_e = tl.exp(v_r - mx)
+    e_a_e = tl.exp(v_a - mx)
+    inv_s2 = 1.0 / (e_t_e + e_r_e + e_a_e)
+
+    tl.store(Tfull_ptr + offs, t_full, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 0, e_t_e * inv_s2, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 1, e_r_e * inv_s2, mask=mask)
+    tl.store(Esplit_ptr + offs * 3 + 2, e_a_e * inv_s2, mask=mask)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# BACKWARD kernel — direct radiation
+#
+# Recomputes the forward in registers, then backpropagates.
+# Weight gradients are accumulated via tl.atomic_add.
+# ──────────────────────────────────────────────────────────────────────
+# NOTE: no @triton.autotune — autotune runs the kernel multiple times
+# for benchmarking, but tl.atomic_add accumulates into the SAME output
+# buffers each run, corrupting the gradient accumulators.
+@triton.jit
+def _scat_train_direct_bwd_kernel(
+    # Inputs (for recomputation)
+    Tau_ptr, Mu_ptr,
+    W0_BD_ptr, B0_ptr,
+    WH0_BD_ptr, BH0_ptr,
+    WH1_BD_ptr, BH1_ptr,
+    WO_BD_ptr, BO_ptr,
+    Wsel_ptr,
+    # Upstream gradients
+    dTfull_ptr,         # [B_total] FP32
+    dEsplit_ptr,        # [B_total, 3] FP32
+    # Output gradients (accumulated via atomic_add)
+    dW0_BD_ptr, dB0_ptr,
+    dWH0_BD_ptr, dBH0_ptr,
+    dWH1_BD_ptr, dBH1_ptr,
+    dWO_BD_ptr, dBO_ptr,
+    dWsel_ptr,          # [n_ch, 8]
+    # Input gradient output
+    dTau_ptr,           # [B, n_ch, 8] — written (not atomic)
+    # Sizes
+    B_total,
+    n_channels: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = offs < B_total
+
+    b_idx = offs // n_channels
+    c_idx = offs % n_channels
+
+    c16 = tl.arange(0, 16)
+    c4 = tl.arange(0, 4)
+
+    # ════════════════════════════════════════════════════════════════
+    # PHASE 1: Recompute forward (save activations for backward)
+    # ════════════════════════════════════════════════════════════════
+
+    tau_pad = tl.load(
+        Tau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        mask=mask[:, None] & (c16[None, :] < 8), other=0.0)
+    tau_sum = tl.sum(tau_pad, axis=1)
+
+    mu = tl.load(Mu_ptr + b_idx, mask=mask, other=1.0)
+    inv_mu = 1.0 / (mu + 1.0e-7)
+    t_full = tl.exp(-tau_sum * inv_mu)
+
+    x_d = tau_pad * inv_mu[:, None]
+    x_d = tl.where(c16[None, :] == 8, mu[:, None], x_d)
+
+    # Layer 0
+    w0_L = tl.load(W0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    w0_R = tl.load(W0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    b0_L = tl.load(B0_ptr + c16)
+    b0_R = tl.load(B0_ptr + c16 + 16)
+    pre_h0_L = tl.dot(x_d, w0_L, input_precision="ieee") + b0_L[None, :]
+    pre_h0_R = tl.dot(x_d, w0_R, input_precision="ieee") + b0_R[None, :]
+    h0_L = tl.maximum(pre_h0_L, 0.0)
+    h0_R = tl.maximum(pre_h0_R, 0.0)
+
+    # Hidden 0
+    wh0_L = tl.load(WH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh0_R = tl.load(WH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh0_L = tl.load(BH0_ptr + c16)
+    bh0_R = tl.load(BH0_ptr + c16 + 16)
+    pre_h1_L = tl.dot(tl.minimum(h0_L, 65504.0).to(tl.float16), wh0_L, out_dtype=tl.float32) + bh0_L[None, :]
+    pre_h1_R = tl.dot(tl.minimum(h0_R, 65504.0).to(tl.float16), wh0_R, out_dtype=tl.float32) + bh0_R[None, :]
+    h1_L = tl.maximum(pre_h1_L, 0.0)
+    h1_R = tl.maximum(pre_h1_R, 0.0)
+
+    # Hidden 1
+    wh1_L = tl.load(WH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh1_R = tl.load(WH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh1_L = tl.load(BH1_ptr + c16)
+    bh1_R = tl.load(BH1_ptr + c16 + 16)
+    pre_h2_L = tl.dot(tl.minimum(h1_L, 65504.0).to(tl.float16), wh1_L, out_dtype=tl.float32) + bh1_L[None, :]
+    pre_h2_R = tl.dot(tl.minimum(h1_R, 65504.0).to(tl.float16), wh1_R, out_dtype=tl.float32) + bh1_R[None, :]
+    h2_L = tl.maximum(pre_h2_L, 0.0)
+    h2_R = tl.maximum(pre_h2_R, 0.0)
+
+    # Output
+    wo_L = tl.load(WO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wo_R = tl.load(WO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bo_L = tl.load(BO_ptr + c16)
+    bo_R = tl.load(BO_ptr + c16 + 16)
+    out_L = tl.dot(tl.minimum(h2_L, 65504.0).to(tl.float16), wo_L, out_dtype=tl.float32) + bo_L[None, :]
+    out_R = tl.dot(tl.minimum(h2_R, 65504.0).to(tl.float16), wo_R, out_dtype=tl.float32) + bo_R[None, :]
+
+    # Group softmax (save basis for selection backward)
+    out_gL = tl.reshape(out_L, [BLOCK_B * 4, 4])
+    m_gL = tl.max(out_gL, axis=1)[:, None]
+    out_gL = tl.exp(out_gL - m_gL)
+    s_gL = tl.sum(out_gL, axis=1)[:, None]
+    out_gL = out_gL / s_gL
+    basis_L = tl.reshape(out_gL, [BLOCK_B, 4, 4])
+
+    out_gR = tl.reshape(out_R, [BLOCK_B * 4, 4])
+    m_gR = tl.max(out_gR, axis=1)[:, None]
+    out_gR = tl.exp(out_gR - m_gR)
+    s_gR = tl.sum(out_gR, axis=1)[:, None]
+    out_gR = out_gR / s_gR
+    basis_R = tl.reshape(out_gR, [BLOCK_B, 4, 4])
+
+    # Selection
+    wsel_L = tl.load(Wsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                     mask=mask[:, None], other=0.0)
+    wsel_R = tl.load(Wsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                     mask=mask[:, None], other=0.0)
+    combined = (tl.sum(basis_L * wsel_L[:, :, None], axis=1) +
+                tl.sum(basis_R * wsel_R[:, :, None], axis=1))
+
+    # Final 3-way softmax
+    combined_22 = tl.reshape(combined, [BLOCK_B, 2, 2])
+    T_even, T_odd = tl.split(combined_22)
+    v_t, v_a = tl.split(T_even)
+    v_r, _v_dead = tl.split(T_odd)
+
+    mx = tl.maximum(tl.maximum(v_t, v_r), v_a)
+    e_t = tl.exp(v_t - mx)
+    e_r = tl.exp(v_r - mx)
+    e_a = tl.exp(v_a - mx)
+    inv_s = 1.0 / (e_t + e_r + e_a)
+    s_t = e_t * inv_s   # softmax outputs
+    s_r = e_r * inv_s
+    s_a = e_a * inv_s
+
+    # ════════════════════════════════════════════════════════════════
+    # PHASE 2: Backward
+    # ════════════════════════════════════════════════════════════════
+
+    # Load upstream gradients
+    d_tfull = tl.load(dTfull_ptr + offs, mask=mask, other=0.0)
+    d_st = tl.load(dEsplit_ptr + offs * 3 + 0, mask=mask, other=0.0)
+    d_sr = tl.load(dEsplit_ptr + offs * 3 + 1, mask=mask, other=0.0)
+    d_sa = tl.load(dEsplit_ptr + offs * 3 + 2, mask=mask, other=0.0)
+
+    # ── (1) Final 3-way softmax backward ──
+    # d_logit_i = s_i * (d_s_i - dot(s, d_s))
+    dot_sd = s_t * d_st + s_r * d_sr + s_a * d_sa
+    d_vt = s_t * (d_st - dot_sd)
+    d_vr = s_r * (d_sr - dot_sd)
+    d_va = s_a * (d_sa - dot_sd)
+
+    # ── (2) Backward from (v_t, v_r, v_a) to combined [BLOCK_B, 4] ──
+    # combined layout: [v_t, v_r, v_a, dead]
+    # (tl.split splits the LAST dim: [B,2,2] → cols 0,1;
+    #  then [c0,c2] → v_t=c0, v_a=c2 and [c1,c3] → v_r=c1, dead=c3)
+    d_combined_0 = d_vt   # index 0 → v_t
+    d_combined_1 = d_vr   # index 1 → v_r
+    d_combined_2 = d_va   # index 2 → v_a
+    d_combined_3 = tl.zeros([BLOCK_B], dtype=tl.float32)  # index 3 (dead)
+
+    # ── (3) Selection backward ──
+    # combined = sum(basis_L * wsel_L[:,:,None], axis=1) + sum(basis_R * wsel_R[:,:,None], axis=1)
+    # d_basis_L[b, g, p] = wsel_L[b, g] * d_combined[b, p]
+    # d_wsel_L[b, g] = sum_p(basis_L[b, g, p] * d_combined[b, p])
+
+    # Build d_combined as [BLOCK_B, 4]
+    # We need: d_combined[:, 0] = d_vt, [:, 1] = d_vr, [:, 2] = d_va, [:, 3] = 0
+    d_comb_col0 = d_combined_0[:, None] * (c4[None, :] == 0).to(tl.float32)
+    d_comb_col1 = d_combined_1[:, None] * (c4[None, :] == 1).to(tl.float32)
+    d_comb_col2 = d_combined_2[:, None] * (c4[None, :] == 2).to(tl.float32)
+    d_combined_4 = d_comb_col0 + d_comb_col1 + d_comb_col2  # [BLOCK_B, 4]
+
+    # d_basis_L = wsel_L[:, :, None] * d_combined_4[:, None, :]
+    d_basis_L = wsel_L[:, :, None] * d_combined_4[:, None, :]  # [B, 4, 4]
+    d_basis_R = wsel_R[:, :, None] * d_combined_4[:, None, :]
+
+    # d_wsel_L = sum(basis_L * d_combined_4[:, None, :], axis=2)
+    d_wsel_L_local = tl.sum(basis_L * d_combined_4[:, None, :], axis=2)  # [B, 4]
+    d_wsel_R_local = tl.sum(basis_R * d_combined_4[:, None, :], axis=2)
+
+    # Atomic-add wsel gradients (indexed by channel)
+    tl.atomic_add(dWsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                  d_wsel_L_local, mask=mask[:, None])
+    tl.atomic_add(dWsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                  d_wsel_R_local, mask=mask[:, None])
+
+    # ── (4) Per-group softmax backward ──
+    # basis = softmax(out_group) → d_out_group = basis * (d_basis - dot(basis, d_basis))
+    # Flatten basis and d_basis to [BLOCK_B*4, 4]
+    d_basis_L_flat = tl.reshape(d_basis_L, [BLOCK_B * 4, 4])
+    basis_L_flat = tl.reshape(basis_L, [BLOCK_B * 4, 4])
+    dot_L = tl.sum(basis_L_flat * d_basis_L_flat, axis=1)[:, None]
+    d_out_L = basis_L_flat * (d_basis_L_flat - dot_L)
+    d_out_L = tl.reshape(d_out_L, [BLOCK_B, 16])
+
+    d_basis_R_flat = tl.reshape(d_basis_R, [BLOCK_B * 4, 4])
+    basis_R_flat = tl.reshape(basis_R, [BLOCK_B * 4, 4])
+    dot_R = tl.sum(basis_R_flat * d_basis_R_flat, axis=1)[:, None]
+    d_out_R = basis_R_flat * (d_basis_R_flat - dot_R)
+    d_out_R = tl.reshape(d_out_R, [BLOCK_B, 16])
+
+    # ── (5) Output layer backward ──
+    # out_L = h2_L.fp16 @ wo_L + bo_L
+    # d_h2_L = d_out_L @ wo_L.T  (input grad)
+    d_h2_L = tl.dot(d_out_L.to(tl.float16), tl.trans(wo_L), out_dtype=tl.float32)
+    d_h2_R = tl.dot(d_out_R.to(tl.float16), tl.trans(wo_R), out_dtype=tl.float32)
+
+    # d_wo_L = h2_L.T @ d_out_L  (weight grad — partial, atomic-add)
+    d_wo_L_local = tl.dot(
+        tl.trans(tl.minimum(h2_L, 65504.0).to(tl.float16)),
+        d_out_L.to(tl.float16), out_dtype=tl.float32)
+    d_wo_R_local = tl.dot(
+        tl.trans(tl.minimum(h2_R, 65504.0).to(tl.float16)),
+        d_out_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wo_L_local)
+    tl.atomic_add(dWO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wo_R_local)
+
+    # d_bo
+    d_bo_L_local = tl.sum(d_out_L, axis=0)  # [16]
+    d_bo_R_local = tl.sum(d_out_R, axis=0)
+    tl.atomic_add(dBO_ptr + c16, d_bo_L_local)
+    tl.atomic_add(dBO_ptr + c16 + 16, d_bo_R_local)
+
+    # ─��� (6) ReLU backward on h2 ──
+    d_h2_L = d_h2_L * (h2_L > 0).to(tl.float32)
+    d_h2_R = d_h2_R * (h2_R > 0).to(tl.float32)
+
+    # ── (7) Hidden 1 backward ──
+    # h2 = relu(h1.fp16 @ wh1 + bh1)
+    d_h1_L = tl.dot(d_h2_L.to(tl.float16), tl.trans(wh1_L), out_dtype=tl.float32)
+    d_h1_R = tl.dot(d_h2_R.to(tl.float16), tl.trans(wh1_R), out_dtype=tl.float32)
+
+    d_wh1_L_local = tl.dot(
+        tl.trans(tl.minimum(h1_L, 65504.0).to(tl.float16)),
+        d_h2_L.to(tl.float16), out_dtype=tl.float32)
+    d_wh1_R_local = tl.dot(
+        tl.trans(tl.minimum(h1_R, 65504.0).to(tl.float16)),
+        d_h2_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wh1_L_local)
+    tl.atomic_add(dWH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wh1_R_local)
+
+    d_bh1_L_local = tl.sum(d_h2_L, axis=0)
+    d_bh1_R_local = tl.sum(d_h2_R, axis=0)
+    tl.atomic_add(dBH1_ptr + c16, d_bh1_L_local)
+    tl.atomic_add(dBH1_ptr + c16 + 16, d_bh1_R_local)
+
+    # ReLU backward on h1
+    d_h1_L = d_h1_L * (h1_L > 0).to(tl.float32)
+    d_h1_R = d_h1_R * (h1_R > 0).to(tl.float32)
+
+    # ── (8) Hidden 0 backward ──
+    d_h0_L = tl.dot(d_h1_L.to(tl.float16), tl.trans(wh0_L), out_dtype=tl.float32)
+    d_h0_R = tl.dot(d_h1_R.to(tl.float16), tl.trans(wh0_R), out_dtype=tl.float32)
+
+    d_wh0_L_local = tl.dot(
+        tl.trans(tl.minimum(h0_L, 65504.0).to(tl.float16)),
+        d_h1_L.to(tl.float16), out_dtype=tl.float32)
+    d_wh0_R_local = tl.dot(
+        tl.trans(tl.minimum(h0_R, 65504.0).to(tl.float16)),
+        d_h1_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wh0_L_local)
+    tl.atomic_add(dWH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wh0_R_local)
+
+    d_bh0_L_local = tl.sum(d_h1_L, axis=0)
+    d_bh0_R_local = tl.sum(d_h1_R, axis=0)
+    tl.atomic_add(dBH0_ptr + c16, d_bh0_L_local)
+    tl.atomic_add(dBH0_ptr + c16 + 16, d_bh0_R_local)
+
+    # ReLU backward on h0
+    d_h0_L = d_h0_L * (h0_L > 0).to(tl.float32)
+    d_h0_R = d_h0_R * (h0_R > 0).to(tl.float32)
+
+    # ── (9) Input layer backward ──
+    # h0 = relu(x_d @ w0 + b0)
+    # d_x_d = d_h0_L @ w0_L.T + d_h0_R @ w0_R.T  (x_d feeds both halves)
+    d_x_d = tl.dot(d_h0_L, tl.trans(w0_L), input_precision="ieee")
+    d_x_d += tl.dot(d_h0_R, tl.trans(w0_R), input_precision="ieee")
+
+    d_w0_L_local = tl.dot(tl.trans(x_d), d_h0_L, input_precision="ieee")
+    d_w0_R_local = tl.dot(tl.trans(x_d), d_h0_R, input_precision="ieee")
+    tl.atomic_add(dW0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_w0_L_local)
+    tl.atomic_add(dW0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_w0_R_local)
+
+    d_b0_L_local = tl.sum(d_h0_L, axis=0)
+    d_b0_R_local = tl.sum(d_h0_R, axis=0)
+    tl.atomic_add(dB0_ptr + c16, d_b0_L_local)
+    tl.atomic_add(dB0_ptr + c16 + 16, d_b0_R_local)
+
+    # ── (10) Backward through input transform → d_tau ──
+    # x_d = tau_pad * inv_mu (columns 0-7); x_d[8] = mu
+    # d_tau_pad_from_mlp = d_x_d[:, 0:8] * inv_mu
+    d_tau_from_mlp = tl.where(c16[None, :] < 8,
+                              d_x_d * inv_mu[:, None], 0.0)
+
+    # Plus: t_full = exp(-tau_sum * inv_mu)
+    # d_tau_sum = d_tfull * (-t_full * inv_mu)
+    d_tau_sum = d_tfull * (-t_full * inv_mu)
+    # Each tau constituent contributes equally to tau_sum
+    d_tau_from_tfull = tl.where(c16[None, :] < 8,
+                                d_tau_sum[:, None], 0.0)
+
+    d_tau = d_tau_from_mlp + d_tau_from_tfull
+
+    # Store d_tau (not atomic — each row writes its own output)
+    tl.store(
+        dTau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        d_tau,
+        mask=mask[:, None] & (c16[None, :] < 8))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# BACKWARD kernel — diffuse radiation
+# ──────────────────────────────────────────────────────────────────────
+@triton.jit
+def _scat_train_diffuse_bwd_kernel(
+    Tau_ptr, inv_mu_diffuse,
+    W0_BD_ptr, B0_ptr,
+    WH0_BD_ptr, BH0_ptr,
+    WH1_BD_ptr, BH1_ptr,
+    WO_BD_ptr, BO_ptr,
+    Wsel_ptr,
+    dTfull_ptr, dEsplit_ptr,
+    dW0_BD_ptr, dB0_ptr,
+    dWH0_BD_ptr, dBH0_ptr,
+    dWH1_BD_ptr, dBH1_ptr,
+    dWO_BD_ptr, dBO_ptr,
+    dWsel_ptr,
+    dTau_ptr,           # [B, n_ch, 8] — ADDED to (not overwritten)
+    B_total,
+    n_channels: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Backward for diffuse scattering. Same as direct but:
+    - No mu input (uses scalar inv_mu_diffuse)
+    - MLP input is raw tau (no scaling, no mu append)
+    - d_tau is ADDED to existing values (direct kernel wrote first)
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = offs < B_total
+
+    b_idx = offs // n_channels
+    c_idx = offs % n_channels
+
+    c16 = tl.arange(0, 16)
+    c4 = tl.arange(0, 4)
+
+    # ── Recompute forward ──
+    tau_pad = tl.load(
+        Tau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        mask=mask[:, None] & (c16[None, :] < 8), other=0.0)
+    tau_sum = tl.sum(tau_pad, axis=1)
+    t_full = tl.exp(-tau_sum * inv_mu_diffuse)
+
+    x_d = tau_pad  # diffuse: raw tau
+
+    # Layer 0
+    w0_L = tl.load(W0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    w0_R = tl.load(W0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    b0_L = tl.load(B0_ptr + c16)
+    b0_R = tl.load(B0_ptr + c16 + 16)
+    pre_h0_L = tl.dot(x_d, w0_L, input_precision="ieee") + b0_L[None, :]
+    pre_h0_R = tl.dot(x_d, w0_R, input_precision="ieee") + b0_R[None, :]
+    h0_L = tl.maximum(pre_h0_L, 0.0)
+    h0_R = tl.maximum(pre_h0_R, 0.0)
+
+    # Hidden 0
+    wh0_L = tl.load(WH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh0_R = tl.load(WH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh0_L = tl.load(BH0_ptr + c16)
+    bh0_R = tl.load(BH0_ptr + c16 + 16)
+    pre_h1_L = tl.dot(tl.minimum(h0_L, 65504.0).to(tl.float16), wh0_L, out_dtype=tl.float32) + bh0_L[None, :]
+    pre_h1_R = tl.dot(tl.minimum(h0_R, 65504.0).to(tl.float16), wh0_R, out_dtype=tl.float32) + bh0_R[None, :]
+    h1_L = tl.maximum(pre_h1_L, 0.0)
+    h1_R = tl.maximum(pre_h1_R, 0.0)
+
+    # Hidden 1
+    wh1_L = tl.load(WH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wh1_R = tl.load(WH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bh1_L = tl.load(BH1_ptr + c16)
+    bh1_R = tl.load(BH1_ptr + c16 + 16)
+    pre_h2_L = tl.dot(tl.minimum(h1_L, 65504.0).to(tl.float16), wh1_L, out_dtype=tl.float32) + bh1_L[None, :]
+    pre_h2_R = tl.dot(tl.minimum(h1_R, 65504.0).to(tl.float16), wh1_R, out_dtype=tl.float32) + bh1_R[None, :]
+    h2_L = tl.maximum(pre_h2_L, 0.0)
+    h2_R = tl.maximum(pre_h2_R, 0.0)
+
+    # Output
+    wo_L = tl.load(WO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :])
+    wo_R = tl.load(WO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :])
+    bo_L = tl.load(BO_ptr + c16)
+    bo_R = tl.load(BO_ptr + c16 + 16)
+    out_L = tl.dot(tl.minimum(h2_L, 65504.0).to(tl.float16), wo_L, out_dtype=tl.float32) + bo_L[None, :]
+    out_R = tl.dot(tl.minimum(h2_R, 65504.0).to(tl.float16), wo_R, out_dtype=tl.float32) + bo_R[None, :]
+
+    # Group softmax
+    out_gL = tl.reshape(out_L, [BLOCK_B * 4, 4])
+    m_gL = tl.max(out_gL, axis=1)[:, None]
+    out_gL = tl.exp(out_gL - m_gL)
+    s_gL = tl.sum(out_gL, axis=1)[:, None]
+    out_gL = out_gL / s_gL
+    basis_L = tl.reshape(out_gL, [BLOCK_B, 4, 4])
+
+    out_gR = tl.reshape(out_R, [BLOCK_B * 4, 4])
+    m_gR = tl.max(out_gR, axis=1)[:, None]
+    out_gR = tl.exp(out_gR - m_gR)
+    s_gR = tl.sum(out_gR, axis=1)[:, None]
+    out_gR = out_gR / s_gR
+    basis_R = tl.reshape(out_gR, [BLOCK_B, 4, 4])
+
+    # Selection
+    wsel_L = tl.load(Wsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                     mask=mask[:, None], other=0.0)
+    wsel_R = tl.load(Wsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                     mask=mask[:, None], other=0.0)
+    combined = (tl.sum(basis_L * wsel_L[:, :, None], axis=1) +
+                tl.sum(basis_R * wsel_R[:, :, None], axis=1))
+
+    # Final softmax
+    combined_22 = tl.reshape(combined, [BLOCK_B, 2, 2])
+    T_even, T_odd = tl.split(combined_22)
+    v_t, v_a = tl.split(T_even)
+    v_r, _v_dead = tl.split(T_odd)
+    mx = tl.maximum(tl.maximum(v_t, v_r), v_a)
+    e_t = tl.exp(v_t - mx)
+    e_r = tl.exp(v_r - mx)
+    e_a = tl.exp(v_a - mx)
+    inv_s = 1.0 / (e_t + e_r + e_a)
+    s_t = e_t * inv_s
+    s_r = e_r * inv_s
+    s_a = e_a * inv_s
+
+    # ── Backward ──
+    d_tfull = tl.load(dTfull_ptr + offs, mask=mask, other=0.0)
+    d_st = tl.load(dEsplit_ptr + offs * 3 + 0, mask=mask, other=0.0)
+    d_sr = tl.load(dEsplit_ptr + offs * 3 + 1, mask=mask, other=0.0)
+    d_sa = tl.load(dEsplit_ptr + offs * 3 + 2, mask=mask, other=0.0)
+
+    # Final softmax backward
+    dot_sd = s_t * d_st + s_r * d_sr + s_a * d_sa
+    d_vt = s_t * (d_st - dot_sd)
+    d_vr = s_r * (d_sr - dot_sd)
+    d_va = s_a * (d_sa - dot_sd)
+
+    # combined layout: [v_t, v_r, v_a, dead]
+    d_comb_col0 = d_vt[:, None] * (c4[None, :] == 0).to(tl.float32)
+    d_comb_col1 = d_vr[:, None] * (c4[None, :] == 1).to(tl.float32)
+    d_comb_col2 = d_va[:, None] * (c4[None, :] == 2).to(tl.float32)
+    d_combined_4 = d_comb_col0 + d_comb_col1 + d_comb_col2
+
+    # Selection backward
+    d_basis_L = wsel_L[:, :, None] * d_combined_4[:, None, :]
+    d_basis_R = wsel_R[:, :, None] * d_combined_4[:, None, :]
+
+    d_wsel_L_local = tl.sum(basis_L * d_combined_4[:, None, :], axis=2)
+    d_wsel_R_local = tl.sum(basis_R * d_combined_4[:, None, :], axis=2)
+    tl.atomic_add(dWsel_ptr + c_idx[:, None] * 8 + c4[None, :],
+                  d_wsel_L_local, mask=mask[:, None])
+    tl.atomic_add(dWsel_ptr + c_idx[:, None] * 8 + (c4[None, :] + 4),
+                  d_wsel_R_local, mask=mask[:, None])
+
+    # Group softmax backward
+    d_basis_L_flat = tl.reshape(d_basis_L, [BLOCK_B * 4, 4])
+    basis_L_flat = tl.reshape(basis_L, [BLOCK_B * 4, 4])
+    dot_L = tl.sum(basis_L_flat * d_basis_L_flat, axis=1)[:, None]
+    d_out_L = basis_L_flat * (d_basis_L_flat - dot_L)
+    d_out_L = tl.reshape(d_out_L, [BLOCK_B, 16])
+
+    d_basis_R_flat = tl.reshape(d_basis_R, [BLOCK_B * 4, 4])
+    basis_R_flat = tl.reshape(basis_R, [BLOCK_B * 4, 4])
+    dot_R = tl.sum(basis_R_flat * d_basis_R_flat, axis=1)[:, None]
+    d_out_R = basis_R_flat * (d_basis_R_flat - dot_R)
+    d_out_R = tl.reshape(d_out_R, [BLOCK_B, 16])
+
+    # Output layer backward
+    d_h2_L = tl.dot(d_out_L.to(tl.float16), tl.trans(wo_L), out_dtype=tl.float32)
+    d_h2_R = tl.dot(d_out_R.to(tl.float16), tl.trans(wo_R), out_dtype=tl.float32)
+
+    d_wo_L_local = tl.dot(tl.trans(tl.minimum(h2_L, 65504.0).to(tl.float16)),
+                          d_out_L.to(tl.float16), out_dtype=tl.float32)
+    d_wo_R_local = tl.dot(tl.trans(tl.minimum(h2_R, 65504.0).to(tl.float16)),
+                          d_out_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWO_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wo_L_local)
+    tl.atomic_add(dWO_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wo_R_local)
+    d_bo_L_local = tl.sum(d_out_L, axis=0)
+    d_bo_R_local = tl.sum(d_out_R, axis=0)
+    tl.atomic_add(dBO_ptr + c16, d_bo_L_local)
+    tl.atomic_add(dBO_ptr + c16 + 16, d_bo_R_local)
+
+    # ReLU backward h2
+    d_h2_L = d_h2_L * (h2_L > 0).to(tl.float32)
+    d_h2_R = d_h2_R * (h2_R > 0).to(tl.float32)
+
+    # Hidden 1 backward
+    d_h1_L = tl.dot(d_h2_L.to(tl.float16), tl.trans(wh1_L), out_dtype=tl.float32)
+    d_h1_R = tl.dot(d_h2_R.to(tl.float16), tl.trans(wh1_R), out_dtype=tl.float32)
+    d_wh1_L_local = tl.dot(tl.trans(tl.minimum(h1_L, 65504.0).to(tl.float16)),
+                           d_h2_L.to(tl.float16), out_dtype=tl.float32)
+    d_wh1_R_local = tl.dot(tl.trans(tl.minimum(h1_R, 65504.0).to(tl.float16)),
+                           d_h2_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWH1_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wh1_L_local)
+    tl.atomic_add(dWH1_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wh1_R_local)
+    d_bh1_L_local = tl.sum(d_h2_L, axis=0)
+    d_bh1_R_local = tl.sum(d_h2_R, axis=0)
+    tl.atomic_add(dBH1_ptr + c16, d_bh1_L_local)
+    tl.atomic_add(dBH1_ptr + c16 + 16, d_bh1_R_local)
+
+    d_h1_L = d_h1_L * (h1_L > 0).to(tl.float32)
+    d_h1_R = d_h1_R * (h1_R > 0).to(tl.float32)
+
+    # Hidden 0 backward
+    d_h0_L = tl.dot(d_h1_L.to(tl.float16), tl.trans(wh0_L), out_dtype=tl.float32)
+    d_h0_R = tl.dot(d_h1_R.to(tl.float16), tl.trans(wh0_R), out_dtype=tl.float32)
+    d_wh0_L_local = tl.dot(tl.trans(tl.minimum(h0_L, 65504.0).to(tl.float16)),
+                           d_h1_L.to(tl.float16), out_dtype=tl.float32)
+    d_wh0_R_local = tl.dot(tl.trans(tl.minimum(h0_R, 65504.0).to(tl.float16)),
+                           d_h1_R.to(tl.float16), out_dtype=tl.float32)
+    tl.atomic_add(dWH0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_wh0_L_local)
+    tl.atomic_add(dWH0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_wh0_R_local)
+    d_bh0_L_local = tl.sum(d_h1_L, axis=0)
+    d_bh0_R_local = tl.sum(d_h1_R, axis=0)
+    tl.atomic_add(dBH0_ptr + c16, d_bh0_L_local)
+    tl.atomic_add(dBH0_ptr + c16 + 16, d_bh0_R_local)
+
+    d_h0_L = d_h0_L * (h0_L > 0).to(tl.float32)
+    d_h0_R = d_h0_R * (h0_R > 0).to(tl.float32)
+
+    # Input layer backward
+    d_x_d = tl.dot(d_h0_L, tl.trans(w0_L), input_precision="ieee")
+    d_x_d += tl.dot(d_h0_R, tl.trans(w0_R), input_precision="ieee")
+
+    d_w0_L_local = tl.dot(tl.trans(x_d), d_h0_L, input_precision="ieee")
+    d_w0_R_local = tl.dot(tl.trans(x_d), d_h0_R, input_precision="ieee")
+    tl.atomic_add(dW0_BD_ptr + 0 * 256 + c16[:, None] * 16 + c16[None, :], d_w0_L_local)
+    tl.atomic_add(dW0_BD_ptr + 1 * 256 + c16[:, None] * 16 + c16[None, :], d_w0_R_local)
+    d_b0_L_local = tl.sum(d_h0_L, axis=0)
+    d_b0_R_local = tl.sum(d_h0_R, axis=0)
+    tl.atomic_add(dB0_ptr + c16, d_b0_L_local)
+    tl.atomic_add(dB0_ptr + c16 + 16, d_b0_R_local)
+
+    # Backward to tau (diffuse: x_d = tau_pad, no mu scaling)
+    d_tau_from_mlp = tl.where(c16[None, :] < 8, d_x_d, 0.0)
+
+    # t_full = exp(-tau_sum * inv_mu_diffuse)
+    d_tau_sum = d_tfull * (-t_full * inv_mu_diffuse)
+    d_tau_from_tfull = tl.where(c16[None, :] < 8, d_tau_sum[:, None], 0.0)
+
+    d_tau = d_tau_from_mlp + d_tau_from_tfull
+
+    # ADD to existing d_tau (direct kernel already wrote its contribution)
+    existing = tl.load(
+        dTau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        mask=mask[:, None] & (c16[None, :] < 8), other=0.0)
+    tl.store(
+        dTau_ptr + b_idx[:, None] * n_channels * 8 + c_idx[:, None] * 8 + c16[None, :],
+        existing + d_tau,
+        mask=mask[:, None] & (c16[None, :] < 8))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helper: pack MultipleMLPs parameters to BD format
+# ──────────────────────────────────────────────────────────────────────
+def pack_weights_to_bd(mlp, n_inputs, device):
+    """Convert a MultipleMLPs' parameters to BD-packed format for Triton.
+
+    Returns (w0_bd, b0, wh0_bd, bh0, wh1_bd, bh1, wo_bd, bo) as
+    contiguous tensors.  The returned tensors are VIEWS/COPIES that
+    share no storage with the original parameters — safe for gradient
+    accumulation.
+    """
+    with torch.no_grad():
+        # Input layer: [n_inputs, 32] → [16, 32] padded → [2, 16, 16]
+        w0_full = torch.zeros(16, 32, device=device, dtype=torch.float32)
+        w0_full[:n_inputs, :].copy_(mlp.input_weight.detach())
+        w0_bd = torch.stack([w0_full[:, :16], w0_full[:, 16:]], dim=0).contiguous()
+
+        b0 = mlp.input_bias.detach().contiguous()
+
+        # Hidden layers: [32, 32] × filter → BD [2, 16, 16] FP16
+        filt = mlp.filter
+        wh0_masked = (mlp.weights[0].detach() * filt)
+        wh0_bd = torch.stack([
+            wh0_masked[:16, :16].to(torch.float16),
+            wh0_masked[16:, 16:].to(torch.float16),
+        ], dim=0).contiguous()
+        bh0 = mlp.biases[0].detach().contiguous()
+
+        wh1_masked = (mlp.weights[1].detach() * filt)
+        wh1_bd = torch.stack([
+            wh1_masked[:16, :16].to(torch.float16),
+            wh1_masked[16:, 16:].to(torch.float16),
+        ], dim=0).contiguous()
+        bh1 = mlp.biases[1].detach().contiguous()
+
+        # Output layer: [32, 24] → rearranged [32, 32] → BD [2, 16, 16] FP16
+        out_filt = mlp.output_filter
+        wo_full = torch.zeros(32, 32, device=device, dtype=torch.float32)
+        for g in range(8):
+            wo_full[:, 4*g:4*g+3] = (mlp.output_weights.detach()[:, 3*g:3*g+3] *
+                                     out_filt[:, 3*g:3*g+3])
+        wo_bd = torch.stack([
+            wo_full[:16, :16].to(torch.float16),
+            wo_full[16:, 16:].to(torch.float16),
+        ], dim=0).contiguous()
+
+        bo_full = torch.zeros(32, device=device, dtype=torch.float32)
+        for g in range(8):
+            bo_full[4*g:4*g+3] = mlp.output_bias.detach()[3*g:3*g+3]
+            bo_full[4*g+3] = float('-inf')
+        bo = bo_full.contiguous()
+
+    return w0_bd, b0, wh0_bd, bh0, wh1_bd, bh1, wo_bd, bo
+
+
+def unpack_weight_grads_from_bd(d_w0_bd, d_b0, d_wh0_bd, d_bh0,
+                                d_wh1_bd, d_bh1, d_wo_bd, d_bo,
+                                n_inputs, device):
+    """Convert BD-format weight gradients back to original parameter shapes.
+
+    Returns gradients matching MultipleMLPs' parameter shapes.
+    """
+    # Input: d_w0_bd [2, 16, 16] → d_input_weight [n_inputs, 32]
+    d_w0_full_L = d_w0_bd[0]   # [16, 16] — left half columns
+    d_w0_full_R = d_w0_bd[1]   # [16, 16] — right half columns
+    d_input_weight = torch.cat([d_w0_full_L[:n_inputs, :],
+                                d_w0_full_R[:n_inputs, :]], dim=1)
+
+    d_input_bias = d_b0.clone()
+
+    # Hidden: d_wh_bd [2, 16, 16] FP16 → d_weights[k] [32, 32]
+    # Only the block-diagonal elements have real gradients
+    d_w0_hidden = torch.zeros(32, 32, device=device, dtype=torch.float32)
+    d_w0_hidden[:16, :16] = d_wh0_bd[0].float()
+    d_w0_hidden[16:, 16:] = d_wh0_bd[1].float()
+
+    d_w1_hidden = torch.zeros(32, 32, device=device, dtype=torch.float32)
+    d_w1_hidden[:16, :16] = d_wh1_bd[0].float()
+    d_w1_hidden[16:, 16:] = d_wh1_bd[1].float()
+
+    d_bh0_out = d_bh0.clone()
+    d_bh1_out = d_bh1.clone()
+
+    # Output: d_wo_bd [2, 16, 16] FP16 → d_output_weights [32, 24]
+    d_wo_full = torch.zeros(32, 32, device=device, dtype=torch.float32)
+    d_wo_full[:16, :16] = d_wo_bd[0].float()
+    d_wo_full[16:, 16:] = d_wo_bd[1].float()
+
+    d_output_weights = torch.zeros(32, 24, device=device, dtype=torch.float32)
+    for g in range(8):
+        d_output_weights[:, 3*g:3*g+3] = d_wo_full[:, 4*g:4*g+3]
+
+    d_output_bias = torch.zeros(24, device=device, dtype=torch.float32)
+    d_bo_float = d_bo.clone()
+    for g in range(8):
+        d_output_bias[3*g:3*g+3] = d_bo_float[4*g:4*g+3]
+
+    return (d_input_weight, d_input_bias,
+            d_w0_hidden, d_bh0_out,
+            d_w1_hidden, d_bh1_out,
+            d_output_weights, d_output_bias)
+
+
+# ───────────────────────────────────────────────────────────────���──────
+# torch.autograd.Function wrapper
+# ──────────────────────────────────────────────────────────────────────
+class _FusedScatteringFunction(torch.autograd.Function):
+    """Custom autograd function for fused Triton scattering.
+
+    Forward:  Pack weights to BD → launch Triton forward kernels
+    Backward: Zero grad accumulators → launch Triton backward kernels
+              → unpack BD gradients to original parameter shapes
+    """
+
+    @staticmethod
+    def forward(ctx, tau_flat, mu_dir_flat, inv_mu_diffuse,
+                n_channels, B_total,
+                # Direct MLP parameters (need grads)
+                dir_input_weight, dir_input_bias,
+                dir_weight0, dir_bias0,
+                dir_weight1, dir_bias1,
+                dir_output_weights, dir_output_bias,
+                dir_filter, dir_output_filter,
+                # Direct selection
+                dir_sel_weight,
+                # Diffuse MLP parameters
+                dif_input_weight, dif_input_bias,
+                dif_weight0, dif_bias0,
+                dif_weight1, dif_bias1,
+                dif_output_weights, dif_output_bias,
+                dif_filter, dif_output_filter,
+                # Diffuse selection
+                dif_sel_weight):
+
+        device = tau_flat.device
+        ctx.n_channels = n_channels
+        ctx.B_total = B_total
+        # Accept inv_mu_diffuse as a tensor for autograd tracking
+        inv_mu_diffuse_scalar = inv_mu_diffuse.item() if torch.is_tensor(inv_mu_diffuse) else inv_mu_diffuse
+        ctx.inv_mu_diffuse_scalar = inv_mu_diffuse_scalar
+
+        # Pack weights to BD format (detached copies — ~0.1ms)
+        class _FakeMLP:
+            pass
+
+        dir_mlp = _FakeMLP()
+        dir_mlp.input_weight = dir_input_weight
+        dir_mlp.input_bias = dir_input_bias
+        dir_mlp.weights = [dir_weight0, dir_weight1]
+        dir_mlp.biases = [dir_bias0, dir_bias1]
+        dir_mlp.output_weights = dir_output_weights
+        dir_mlp.output_bias = dir_output_bias
+        dir_mlp.filter = dir_filter
+        dir_mlp.output_filter = dir_output_filter
+
+        dif_mlp = _FakeMLP()
+        dif_mlp.input_weight = dif_input_weight
+        dif_mlp.input_bias = dif_input_bias
+        dif_mlp.weights = [dif_weight0, dif_weight1]
+        dif_mlp.biases = [dif_bias0, dif_bias1]
+        dif_mlp.output_weights = dif_output_weights
+        dif_mlp.output_bias = dif_output_bias
+        dif_mlp.filter = dif_filter
+        dif_mlp.output_filter = dif_output_filter
+
+        n_dir_inputs = dir_input_weight.shape[0]  # 9
+        n_dif_inputs = dif_input_weight.shape[0]  # 8
+
+        (w0d, b0d, wh0d, bh0d, wh1d, bh1d, wod, bod) = pack_weights_to_bd(
+            dir_mlp, n_dir_inputs, device)
+        (w0f, b0f, wh0f, bh0f, wh1f, bh1f, wof, bof) = pack_weights_to_bd(
+            dif_mlp, n_dif_inputs, device)
+
+        # Flatten selection weights: [n_ch, 1, 8, 1] → [n_ch, 8]
+        wsel_dir = dir_sel_weight.detach().reshape(n_channels, 8).contiguous()
+        wsel_dif = dif_sel_weight.detach().reshape(n_channels, 8).contiguous()
+
+        # Save for backward (include inv_mu_diffuse tensor for gradient)
+        inv_mu_dif_t = inv_mu_diffuse if torch.is_tensor(inv_mu_diffuse) else torch.tensor(inv_mu_diffuse, device=device)
+        ctx.save_for_backward(
+            tau_flat, mu_dir_flat, inv_mu_dif_t,
+            dir_input_weight, dir_input_bias,
+            dir_weight0, dir_bias0, dir_weight1, dir_bias1,
+            dir_output_weights, dir_output_bias,
+            dir_sel_weight,
+            dif_input_weight, dif_input_bias,
+            dif_weight0, dif_bias0, dif_weight1, dif_bias1,
+            dif_output_weights, dif_output_bias,
+            dif_sel_weight,
+            dir_filter, dir_output_filter,
+            dif_filter, dif_output_filter,
+        )
+
+        # Allocate output buffers
+        t_full_direct = torch.empty(B_total, device=device, dtype=torch.float32)
+        e_split_direct = torch.empty(B_total, 3, device=device, dtype=torch.float32)
+        t_full_diffuse = torch.empty(B_total, device=device, dtype=torch.float32)
+        e_split_diffuse = torch.empty(B_total, 3, device=device, dtype=torch.float32)
+
+        grid = lambda meta: (triton.cdiv(B_total, meta['BLOCK_B']),)
+
+        # Launch forward kernels
+        _scat_train_direct_fwd_kernel[grid](
+            tau_flat, mu_dir_flat,
+            w0d, b0d, wh0d, bh0d, wh1d, bh1d, wod, bod, wsel_dir,
+            t_full_direct, e_split_direct,
+            B_total, n_channels=n_channels)
+
+        _scat_train_diffuse_fwd_kernel[grid](
+            tau_flat, inv_mu_diffuse_scalar,
+            w0f, b0f, wh0f, bh0f, wh1f, bh1f, wof, bof, wsel_dif,
+            t_full_diffuse, e_split_diffuse,
+            B_total, n_channels=n_channels)
+
+        return t_full_direct, e_split_direct, t_full_diffuse, e_split_diffuse
+
+    @staticmethod
+    def backward(ctx, d_t_full_direct, d_e_split_direct,
+                 d_t_full_diffuse, d_e_split_diffuse):
+        (tau_flat, mu_dir_flat, inv_mu_dif_t,
+         dir_iw, dir_ib, dir_w0, dir_b0, dir_w1, dir_b1,
+         dir_ow, dir_ob, dir_sw,
+         dif_iw, dif_ib, dif_w0, dif_b0, dif_w1, dif_b1,
+         dif_ow, dif_ob, dif_sw,
+         dir_filter, dir_output_filter,
+         dif_filter, dif_output_filter,
+        ) = ctx.saved_tensors
+
+        n_channels = ctx.n_channels
+        B_total = ctx.B_total
+        inv_mu_dif = inv_mu_dif_t.item()
+        device = tau_flat.device
+
+        # Re-pack weights for backward recomputation
+        class _FM:
+            pass
+
+        dir_mlp = _FM()
+        dir_mlp.input_weight = dir_iw; dir_mlp.input_bias = dir_ib
+        dir_mlp.weights = [dir_w0, dir_w1]; dir_mlp.biases = [dir_b0, dir_b1]
+        dir_mlp.output_weights = dir_ow; dir_mlp.output_bias = dir_ob
+        dir_mlp.filter = dir_filter; dir_mlp.output_filter = dir_output_filter
+
+        dif_mlp = _FM()
+        dif_mlp.input_weight = dif_iw; dif_mlp.input_bias = dif_ib
+        dif_mlp.weights = [dif_w0, dif_w1]; dif_mlp.biases = [dif_b0, dif_b1]
+        dif_mlp.output_weights = dif_ow; dif_mlp.output_bias = dif_ob
+        dif_mlp.filter = dif_filter; dif_mlp.output_filter = dif_output_filter
+
+        n_dir = dir_iw.shape[0]
+        n_dif = dif_iw.shape[0]
+
+        (w0d, b0d, wh0d, bh0d, wh1d, bh1d, wod, bod) = pack_weights_to_bd(
+            dir_mlp, n_dir, device)
+        (w0f, b0f, wh0f, bh0f, wh1f, bh1f, wof, bof) = pack_weights_to_bd(
+            dif_mlp, n_dif, device)
+
+        wsel_dir = dir_sw.detach().reshape(n_channels, 8).contiguous()
+        wsel_dif = dif_sw.detach().reshape(n_channels, 8).contiguous()
+
+        # Allocate gradient accumulators (zeroed)
+        dw0d = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        db0d = torch.zeros(32, device=device, dtype=torch.float32)
+        dwh0d = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbh0d = torch.zeros(32, device=device, dtype=torch.float32)
+        dwh1d = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbh1d = torch.zeros(32, device=device, dtype=torch.float32)
+        dwod = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbod = torch.zeros(32, device=device, dtype=torch.float32)
+        dwsel_dir_acc = torch.zeros(n_channels, 8, device=device, dtype=torch.float32)
+
+        dw0f = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        db0f = torch.zeros(32, device=device, dtype=torch.float32)
+        dwh0f = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbh0f = torch.zeros(32, device=device, dtype=torch.float32)
+        dwh1f = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbh1f = torch.zeros(32, device=device, dtype=torch.float32)
+        dwof = torch.zeros(2, 16, 16, device=device, dtype=torch.float32)
+        dbof = torch.zeros(32, device=device, dtype=torch.float32)
+        dwsel_dif_acc = torch.zeros(n_channels, 8, device=device, dtype=torch.float32)
+
+        B = tau_flat.shape[0]
+        d_tau = torch.zeros_like(tau_flat)
+
+        # Fixed BLOCK_B (no autotune — autotune corrupts atomic_add accumulators)
+        BLOCK_B = 64
+        grid = (triton.cdiv(B_total, BLOCK_B),)
+
+        d_t_full_direct = d_t_full_direct.contiguous()
+        d_e_split_direct = d_e_split_direct.contiguous()
+        d_t_full_diffuse = d_t_full_diffuse.contiguous()
+        d_e_split_diffuse = d_e_split_diffuse.contiguous()
+
+        _scat_train_direct_bwd_kernel[grid](
+            tau_flat, mu_dir_flat,
+            w0d, b0d, wh0d, bh0d, wh1d, bh1d, wod, bod, wsel_dir,
+            d_t_full_direct, d_e_split_direct,
+            dw0d, db0d, dwh0d, dbh0d, dwh1d, dbh1d, dwod, dbod,
+            dwsel_dir_acc, d_tau,
+            B_total, n_channels=n_channels, BLOCK_B=BLOCK_B, num_warps=4)
+
+        _scat_train_diffuse_bwd_kernel[grid](
+            tau_flat, inv_mu_dif,
+            w0f, b0f, wh0f, bh0f, wh1f, bh1f, wof, bof, wsel_dif,
+            d_t_full_diffuse, d_e_split_diffuse,
+            dw0f, db0f, dwh0f, dbh0f, dwh1f, dbh1f, dwof, dbof,
+            dwsel_dif_acc, d_tau,
+            B_total, n_channels=n_channels, BLOCK_B=BLOCK_B, num_warps=4)
+
+        # Unpack BD gradients to original parameter shapes
+        (d_dir_iw, d_dir_ib, d_dir_w0, d_dir_b0, d_dir_w1, d_dir_b1,
+         d_dir_ow, d_dir_ob) = unpack_weight_grads_from_bd(
+            dw0d, db0d, dwh0d, dbh0d, dwh1d, dbh1d, dwod, dbod,
+            n_dir, device)
+
+        (d_dif_iw, d_dif_ib, d_dif_w0, d_dif_b0, d_dif_w1, d_dif_b1,
+         d_dif_ow, d_dif_ob) = unpack_weight_grads_from_bd(
+            dw0f, db0f, dwh0f, dbh0f, dwh1f, dbh1f, dwof, dbof,
+            n_dif, device)
+
+        d_dir_sw = dwsel_dir_acc.reshape(n_channels, 1, 8, 1)
+        d_dif_sw = dwsel_dif_acc.reshape(n_channels, 1, 8, 1)
+
+        # Gradient for inv_mu_diffuse
+        tau_sum = tau_flat.sum(dim=-1).reshape(-1)
+        t_full_dif_recomp = torch.exp(-tau_sum * inv_mu_dif)
+        d_inv_mu_dif = (d_t_full_diffuse * (-tau_sum * t_full_dif_recomp)).sum()
+        d_inv_mu_dif = d_inv_mu_dif.reshape(inv_mu_dif_t.shape)
+
+        return (d_tau, None, d_inv_mu_dif, None, None,
+                d_dir_iw, d_dir_ib, d_dir_w0, d_dir_b0,
+                d_dir_w1, d_dir_b1, d_dir_ow, d_dir_ob,
+                None, None,  # dir_filter, dir_output_filter
+                d_dir_sw,
+                d_dif_iw, d_dif_ib, d_dif_w0, d_dif_b0,
+                d_dif_w1, d_dif_b1, d_dif_ow, d_dif_ob,
+                None, None,  # dif_filter, dif_output_filter
+                d_dif_sw)
