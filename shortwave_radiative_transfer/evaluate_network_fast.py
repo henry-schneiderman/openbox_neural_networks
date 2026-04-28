@@ -841,6 +841,7 @@ def evaluate_network_analysis(base_prefix, data_prefix):
     if tn.__name__ == 'train_network':
         model_id = "v2."
         n_epoch = 596
+        n_channel = 42
     elif tn.__name__ == 'train_network_5':
         model_id = "v5.1."      # 28 channels instead of 42 
         n_epoch = 669
