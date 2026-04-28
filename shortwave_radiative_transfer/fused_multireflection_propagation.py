@@ -1,0 +1,300 @@
+"""
+Fused Triton kernel for multireflection + propagation.
+
+The original two-kernel pipeline:
+  1. multireflection_timing.MultiReflectionFast writes 6 per-channel tensors
+     [n_samples, n_layers, n_channels] to DRAM (~24 GB/year round-trip).
+  2. fused_propagation.PropagationFused reads them and outputs 4 scalars
+     [n_samples, n_layers(+1)] per layer after reducing across channels.
+
+This fused kernel merges both stages into one program per sample:
+  * First loop (surface -> TOA): compute multireflection coefficients for all
+    layers and stage 4 of them (tm_dir, tm_dif, rsm_dir, rsm_dif) in a
+    temporary global-memory buffer.
+  * Second loop (TOA -> surface): read the staged coefficients (L2-cached
+    since the same block just wrote them), recompute alm from rsm + re-read
+    ea_dir/ea_dif, and produce final propagation outputs.
+
+The staging buffer is 4 * n_layers * n_channels * 4 bytes per sample
+(~40 KB with n_channels=42, n_layers=60).  Since Phase 1 and Phase 2
+run in the same thread block, the writes are L2-hot when Phase 2 reads.
+
+Uses _mul_rn / _rcp_rn / _div_rn PTX inline assembly for IEEE round-to-
+nearest precision, matching multireflection_timing._multireflection_kernel
+to prevent FMA-induced rounding drift across 60 layer iterations.
+
+Author: Henry Schneiderman, henry@pittdata.com
+"""
+
+import torch
+from torch import nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# PTX precision helpers (same as in multireflection_timing.py)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mul_rn(a, b):
+    """Multiply with explicit round-to-nearest, preventing FMA fusion."""
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        "=r,r,r", args=[a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+@triton.jit
+def _rcp_rn(b):
+    """IEEE-compliant reciprocal."""
+    return tl.inline_asm_elementwise(
+        "rcp.rn.f32 $0, $1;",
+        "=r,r", args=[b], dtype=tl.float32, is_pure=True, pack=1)
+
+@triton.jit
+def _div_rn(a, b):
+    """IEEE-compliant division."""
+    return tl.inline_asm_elementwise(
+        "div.rn.f32 $0, $1, $2;",
+        "=r,r,r", args=[a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _fused_multireflection_propagation_kernel(
+    # Multireflection inputs (per-channel, all [n_samples, n_layers, n_channels])
+    Td_ptr, Tdf_ptr,
+    Etd_ptr, Erd_ptr, Ead_ptr,
+    Etf_ptr, Erf_ptr, Eaf_ptr,
+    # Surface tensor [n_samples, 2]
+    Surf_ptr,
+    # Propagation inputs (per-channel)
+    Fdir_in_ptr, Fdif_in_ptr,            # [n_samples, n_channels]
+    # Staging buffer [n_samples, 4, n_layers, n_channels]
+    Stage_ptr,
+    # Propagation outputs ([n_samples, n_layers+1] or [n_samples, n_layers])
+    OutFdd_ptr,    # flux_down_direct  : [n_samples, n_layers+1]
+    OutFddf_ptr,   # flux_down_diffuse : [n_samples, n_layers+1]
+    OutFud_ptr,    # flux_up_diffuse   : [n_samples, n_layers+1]
+    OutAbs_ptr,    # flux_absorbed     : [n_samples, n_layers]
+    n_layers: tl.constexpr,
+    n_channels: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Fused multireflection + propagation kernel.
+
+    One program per sample.  Phase 1 computes multireflection bottom-up and
+    stages 4 tensors (tm_dir, tm_dif, rsm_dir, rsm_dif) in a global-memory
+    buffer; Phase 2 walks top-down for propagation, recomputing alm from
+    rsm + re-read ea values.
+    """
+    sid = tl.program_id(0)
+
+    c = tl.arange(0, BLOCK_C)
+    cmask = c < n_channels
+
+    lc = n_layers * n_channels
+    sbase = sid * lc
+
+    # Staging offsets: Stage_ptr layout is [n_samples, 4, n_layers, n_channels]
+    stage_sample = sid * 4 * lc
+    TMD  = 0    # tensor index for tm_dir
+    TMF  = 1    # tensor index for tm_dif
+    RSMD = 2    # tensor index for rsm_dir
+    RSMF = 3    # tensor index for rsm_dif
+
+    # Load surface albedo once
+    r_s = tl.load(Surf_ptr + sid * 2 + 1).to(tl.float32)
+    zeros = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    rs_dir = zeros + r_s
+    rs_dif = zeros + r_s
+    as_dir = zeros + (1.0 - r_s)
+    as_dif = zeros + (1.0 - r_s)
+
+    rlm_dir = zeros  # set every iteration; init for compiler
+
+    # =====================================================================
+    # PHASE 1: Compute multireflection coefficients (surface -> TOA).
+    # Stage 4 tensors to global memory (L2-hot for Phase 2 read-back).
+    # =====================================================================
+    for j in range(n_layers):
+        i = n_layers - 1 - j
+        off = sbase + i * n_channels + c
+
+        td   = tl.load(Td_ptr   + off, mask=cmask, other=0.0)
+        tdf  = tl.load(Tdf_ptr  + off, mask=cmask, other=0.0)
+        etd  = tl.load(Etd_ptr  + off, mask=cmask, other=0.0)
+        erd  = tl.load(Erd_ptr  + off, mask=cmask, other=0.0)
+        ead  = tl.load(Ead_ptr  + off, mask=cmask, other=0.0)
+        etf  = tl.load(Etf_ptr  + off, mask=cmask, other=0.0)
+        erf  = tl.load(Erf_ptr  + off, mask=cmask, other=0.0)
+        eaf  = tl.load(Eaf_ptr  + off, mask=cmask, other=0.0)
+
+        # Adding-doubling step (with _mul_rn to prevent FMA drift)
+        denom = 1.0 - _mul_rn(erf, rs_dif) + 1.0e-06
+        d = _rcp_rn(denom)
+
+        # Direct beam
+        tm_dir = _div_rn(_mul_rn(td * rs_dir, erf) + etd, denom)
+        rsm_dir = _mul_rn(td * rs_dir, d) + _mul_rn(etd * rs_dif, d)
+        alm_dir = ead + _mul_rn(rsm_dir, eaf)
+        rlm_dir = erd + _mul_rn(rsm_dir, tdf + etf)
+        asm_dir = _mul_rn(td, as_dir) + _mul_rn(tm_dir, as_dif)
+
+        # Diffuse beam
+        tm_dif = _mul_rn(tdf * rs_dif * erf, d) + _mul_rn(etf, d)
+        rsm_dif = _mul_rn(tdf * rs_dif, d) + _mul_rn(etf * rs_dif, d)
+        alm_dif = eaf + _mul_rn(rsm_dif, eaf)
+        rlm_dif = erf + _mul_rn(rsm_dif, tdf + etf)
+        asm_dif = _mul_rn(tdf, as_dif) + _mul_rn(tm_dif, as_dif)
+
+        # Stage 4 tensors to global memory
+        stage_layer = i * n_channels + c
+        tl.store(Stage_ptr + stage_sample + TMD  * lc + stage_layer, tm_dir,  mask=cmask)
+        tl.store(Stage_ptr + stage_sample + TMF  * lc + stage_layer, tm_dif,  mask=cmask)
+        tl.store(Stage_ptr + stage_sample + RSMD * lc + stage_layer, rsm_dir, mask=cmask)
+        tl.store(Stage_ptr + stage_sample + RSMF * lc + stage_layer, rsm_dif, mask=cmask)
+
+        # Merge layer and virtual surface for next iteration
+        rs_dir = rlm_dir
+        rs_dif = rlm_dif
+        as_dir = alm_dir + asm_dir
+        as_dif = alm_dif + asm_dif
+
+    # rlm_dir at end of first loop = upward_reflection_toa
+    toa = rlm_dir
+
+    # =====================================================================
+    # PHASE 2: Propagate radiation (TOA -> surface).
+    # Read staged tm/rsm from global memory (L2-hot), recompute alm from
+    # rsm + re-read ea, and reduce across channels for final outputs.
+    # =====================================================================
+
+    # Load input fluxes once (per-channel)
+    base_ch = sid * n_channels + c
+    flux_direct = tl.load(Fdir_in_ptr + base_ch, mask=cmask, other=0.0)
+    flux_diffuse = tl.load(Fdif_in_ptr + base_ch, mask=cmask, other=0.0)
+
+    # Layer 0 (top of atmosphere): initial fluxes summed across channels
+    fdd0 = tl.sum(tl.where(cmask, flux_direct, 0.0))
+    fdfd0 = tl.sum(tl.where(cmask, flux_diffuse, 0.0))
+    fud0 = tl.sum(tl.where(cmask, flux_direct * toa, 0.0))
+
+    out_base_p1 = sid * (n_layers + 1)
+    out_base = sid * n_layers
+    tl.store(OutFdd_ptr + out_base_p1, fdd0)
+    tl.store(OutFddf_ptr + out_base_p1, fdfd0)
+    tl.store(OutFud_ptr + out_base_p1, fud0)
+
+    # Walk layers top-down
+    for i in range(n_layers):
+        # Read staged multireflection outputs from global memory
+        stage_layer = i * n_channels + c
+        tm_dir  = tl.load(Stage_ptr + stage_sample + TMD  * lc + stage_layer, mask=cmask, other=0.0)
+        tm_dif  = tl.load(Stage_ptr + stage_sample + TMF  * lc + stage_layer, mask=cmask, other=0.0)
+        rsm_dir = tl.load(Stage_ptr + stage_sample + RSMD * lc + stage_layer, mask=cmask, other=0.0)
+        rsm_dif = tl.load(Stage_ptr + stage_sample + RSMF * lc + stage_layer, mask=cmask, other=0.0)
+
+        # Re-read ea_dir and ea_dif to recompute alm
+        off = sbase + i * n_channels + c
+        ead = tl.load(Ead_ptr + off, mask=cmask, other=0.0)
+        eaf = tl.load(Eaf_ptr + off, mask=cmask, other=0.0)
+        alm_dir = ead + _mul_rn(rsm_dir, eaf)
+        alm_dif = eaf + _mul_rn(rsm_dif, eaf)
+
+        # Also need single-layer transmissions
+        td = tl.load(Td_ptr + off, mask=cmask, other=0.0)
+        tdf = tl.load(Tdf_ptr + off, mask=cmask, other=0.0)
+
+        # Compute new flux state for this layer
+        absorbed     = flux_direct * alm_dir + flux_diffuse * alm_dif
+        new_fdd      = flux_direct * td
+        new_fddf     = flux_direct * tm_dir + flux_diffuse * (tdf + tm_dif)
+        new_fud      = flux_direct * rsm_dir + flux_diffuse * rsm_dif
+
+        # Reduce across channels and store
+        absorbed_sum = tl.sum(tl.where(cmask, absorbed, 0.0))
+        fdd_sum      = tl.sum(tl.where(cmask, new_fdd, 0.0))
+        fddf_sum     = tl.sum(tl.where(cmask, new_fddf, 0.0))
+        fud_sum      = tl.sum(tl.where(cmask, new_fud, 0.0))
+
+        tl.store(OutAbs_ptr + out_base + i, absorbed_sum)
+        tl.store(OutFdd_ptr + out_base_p1 + i + 1, fdd_sum)
+        tl.store(OutFddf_ptr + out_base_p1 + i + 1, fddf_sum)
+        tl.store(OutFud_ptr + out_base_p1 + i + 1, fud_sum)
+
+        # Carry state to next layer
+        flux_direct = new_fdd
+        flux_diffuse = new_fddf
+
+
+class MultiReflectionPropagationFused(nn.Module):
+    """Fused replacement for MultiReflectionFast + PropagationFused.
+
+    Combines both kernels into one per-sample program that stages
+    4 multireflection tensors (tm_dir, tm_dif, rsm_dir, rsm_dif) in a
+    temporary global-memory buffer and consumes them immediately for
+    propagation.  The 2 alm tensors are recomputed in Phase 2 from rsm +
+    re-read ea_dir/ea_dif, reducing staging from 6 to 4 tensors.
+
+    The staging buffer is L2-hot because Phase 1 and Phase 2 run in the
+    same thread block.  This eliminates the 6-tensor DRAM round-trip
+    (~500 MB/batch) of the separate kernel pipeline.
+
+    Output shape matches the original propagation:
+        flux_down_direct  : [n_samples, n_layers+1]
+        flux_down_diffuse : [n_samples, n_layers+1]
+        flux_up_diffuse   : [n_samples, n_layers+1]
+        flux_absorbed     : [n_samples, n_layers]
+    """
+
+    def __init__(self, n_channel, device):
+        super().__init__()
+        self.n_channel = n_channel
+        self.device = device
+
+    def forward(self, radiative_layers, x_surface, input_flux):
+        """
+        radiative_layers : [t_direct, t_diffuse, e_t_direct, e_r_direct,
+                           e_a_direct, e_t_diffuse, e_r_diffuse, e_a_diffuse]
+                           each [n_samples, n_layers, n_channels]
+        x_surface        : [n_samples, 2]
+        input_flux       : [flux_direct, flux_diffuse] each [n_samples, n_channels]
+        """
+        t_direct, t_diffuse, e_t_direct, e_r_direct, e_a_direct, \
+            e_t_diffuse, e_r_diffuse, e_a_diffuse = radiative_layers
+
+        flux_direct, flux_diffuse = input_flux
+
+        n_samples, n_layers, n_channels = t_direct.shape
+        device = t_direct.device
+
+        flux_down_direct  = torch.empty((n_samples, n_layers + 1),
+                                        device=device, dtype=torch.float32)
+        flux_down_diffuse = torch.empty((n_samples, n_layers + 1),
+                                        device=device, dtype=torch.float32)
+        flux_up_diffuse   = torch.empty((n_samples, n_layers + 1),
+                                        device=device, dtype=torch.float32)
+        flux_absorbed     = torch.empty((n_samples, n_layers),
+                                        device=device, dtype=torch.float32)
+
+        # Staging buffer: [n_samples, 4, n_layers, n_channels]
+        stage_buf = torch.empty(n_samples, 4, n_layers, n_channels,
+                                device=device, dtype=torch.float32)
+
+        BLOCK_C = triton.next_power_of_2(n_channels)
+
+        _fused_multireflection_propagation_kernel[(n_samples,)](
+            t_direct, t_diffuse,
+            e_t_direct, e_r_direct, e_a_direct,
+            e_t_diffuse, e_r_diffuse, e_a_diffuse,
+            x_surface,
+            flux_direct, flux_diffuse,
+            stage_buf,
+            flux_down_direct, flux_down_diffuse, flux_up_diffuse,
+            flux_absorbed,
+            n_layers=n_layers,
+            n_channels=n_channels,
+            BLOCK_C=BLOCK_C,
+            num_warps=2,
+        )
+
+        return (flux_down_direct, flux_down_diffuse, flux_up_diffuse,
+                flux_absorbed)
