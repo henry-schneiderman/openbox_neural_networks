@@ -1004,7 +1004,7 @@ def get_meta_parameters(n):
         lr = 0.001
         batch_size = 1024
     else:
-        if n % 120 <= 60:
+        if n % 120 <= 60 and n < 600:
             batch_size = 1024
             if n % 60 <= 20:
                 lr = 0.001
@@ -1012,7 +1012,7 @@ def get_meta_parameters(n):
                 lr = 0.0005
             else:
                 lr = 0.00025
-        else:
+        elif n < 900:
             batch_size = 512
             if n % 60 <= 20:
                 lr = 0.0005
@@ -1020,7 +1020,19 @@ def get_meta_parameters(n):
                 lr = 0.00025
             else:
                 lr = 0.000125
-
+        else:
+            batch_size = 512
+            if n % 60 <= 20:
+                batch_size = 512
+                lr = 0.000125
+            elif n % 60 <= 40:
+                batch_size = 512
+                lr = 0.00006125
+            else:
+                batch_size = 256
+                lr = 0.00006125
+                
+                
     return loss_weights, lr, batch_size
 
 def get_dropout(n, n_epochs):
@@ -1186,7 +1198,7 @@ def train_network(data_prefix, model_dir):
 
     ########################
     # Settings
-    n_start = 565 #470 #420 #270
+    n_start = 900 #600 #565 #470 #420 #270
     n_initial_models = 4
     n_best = n_start
 
