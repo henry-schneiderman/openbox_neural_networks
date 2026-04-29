@@ -1,15 +1,9 @@
 """
 Fused Triton kernel for multireflection + propagation.
 
-The original two-kernel pipeline:
-  1. multireflection_timing.MultiReflectionFast writes 6 per-channel tensors
-     [n_samples, n_layers, n_channels] to DRAM (~24 GB/year round-trip).
-  2. fused_propagation.PropagationFused reads them and outputs 4 scalars
-     [n_samples, n_layers(+1)] per layer after reducing across channels.
-
 This fused kernel merges both modules into one program:
   * First loop (surface -> TOA): compute multireflection coefficients for all
-    layers and stage 4 of them (tm_dir, tm_dif, rsm_dir, rsm_dif) in a
+    layers and stage them (tm_dir, tm_dif, rsm_dir, rsm_dif) in a
     temporary global-memory buffer.
   * Second loop (TOA -> surface): read the staged coefficients (L2-cached
     since the same block just wrote them), recompute alm from rsm + re-read
@@ -82,7 +76,7 @@ def _fused_multireflection_propagation_kernel(
     """Fused multireflection + propagation kernel.
 
     One program per sample.  Phase 1 computes multireflection bottom-up and
-    stages 4 tensors (tm_dir, tm_dif, rsm_dir, rsm_dif) in a global-memory
+    stages tensors (tm_dir, tm_dif, rsm_dir, rsm_dif) in a global-memory
     buffer; Phase 2 walks top-down for propagation, recomputing alm from
     rsm + re-read ea values.
     """
