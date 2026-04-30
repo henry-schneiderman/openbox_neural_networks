@@ -59,7 +59,10 @@ t_total = 0.0
 # off the critical path of the optimized run — flip TIMING_ENABLED back
 # to False for operational use.
 # ---------------------------------------------------------------------------
-TIMING_ENABLED = False
+TIMING_ENABLED = os.environ.get("TIMING_ENABLED", "1") == "1"
+
+# Various measures of accuracy
+METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "1") == "1"
 
 # Environmental variables below select the computational pathway.
 
@@ -906,30 +909,30 @@ def evaluate_network_analysis(base_prefix, data_prefix):
             loss_flux_0_05 = nl.mu_selector_flux_maker(0.05, nl.total_rmse)
             loss_flux_0_10 = nl.mu_selector_flux_maker(0.10, nl.total_rmse)
 
+            if METRICS_ENABLED:
+                loss_functions = (
+                    nl.openbox_rmse,
+                    nl.flux_rmse, nl.heating_rate_rmse,
+                    nl.direct_flux_rmse, nl.diffuse_flux_rmse,
+                    nl.flux_bias, nl.downwelling_flux_rmse, nl.upwelling_flux_rmse,
+                    nl.downwelling_flux_bias, nl.upwelling_flux_bias,
+                    nl.direct_extinction_rmse,
+                    nl.diffuse_heating_rate_rmse,
+                    nl.heating_rate_bias,
+                    loss_flux_0_01, loss_flux_0_05, loss_flux_0_10)
 
-            loss_functions = (
-                nl.openbox_rmse,
-                nl.flux_rmse, nl.heating_rate_rmse,
-                nl.direct_flux_rmse, nl.diffuse_flux_rmse,
-                nl.flux_bias, nl.downwelling_flux_rmse, nl.upwelling_flux_rmse,
-                nl.downwelling_flux_bias, nl.upwelling_flux_bias,
-                nl.direct_extinction_rmse,
-                nl.diffuse_heating_rate_rmse,
-                nl.heating_rate_bias,
-                loss_flux_0_01, loss_flux_0_05, loss_flux_0_10)
-
-            loss_names = (
-                "Openbox RMSE",
-                "Flux RMSE", "Heating Rate RMSE",
-                "Direct Flux RMSE", "Diffuse Flux RMSE",
-                "Flux Bias", "Flux Down RMSE", "Flux up RMSE",
-                "Flux Down Bias", "Flux up Bias ",
-                "Direct Extinction RMSE",
-                "Diffuse Heating Rate RMSE",
-                "Heating Rate Bias",
-                "RMSE_flux_0_01", "RMSE_flux_0_05", "RMSE_flux_0_10")
+                loss_names = (
+                    "Openbox RMSE",
+                    "Flux RMSE", "Heating Rate RMSE",
+                    "Direct Flux RMSE", "Diffuse Flux RMSE",
+                    "Flux Bias", "Flux Down RMSE", "Flux up RMSE",
+                    "Flux Down Bias", "Flux up Bias ",
+                    "Direct Extinction RMSE",
+                    "Diffuse Heating Rate RMSE",
+                    "Heating Rate Bias",
+                    "RMSE_flux_0_01", "RMSE_flux_0_05", "RMSE_flux_0_10")
             
-            if False:
+            else:
                 loss_functions = (
                     nl.flux_rmse, nl.heating_rate_rmse)
 
@@ -983,10 +986,10 @@ if __name__ == "__main__":
             data_prefix = "/srv/data/CAMS/processed_data/"  
         else:
             print(f"Unknown argument {sys.argv[1]}")
-            print(f"Usage: python evaluate_network.py [azure|google]")
+            print(f"Usage: python evaluate_network.py [azure | google | local]")
             quit()
     else:
-        print(f"Usage: python evaluate_network.py [azure|google]")
+        print(f"Usage: python evaluate_network.py [azure | google | local]")
         quit()
             
     evaluate_network_analysis(base_prefix=base_prefix,

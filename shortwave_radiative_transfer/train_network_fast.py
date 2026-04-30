@@ -1198,18 +1198,12 @@ def train_network(data_prefix, model_dir):
 
     ########################
     # Settings
-    n_start = 910 #600 #565 #470 #420 #270
+    n_start = 0
     n_initial_models = 4
     n_best = n_start
 
     model_id = "v2.4."
-    model_id = "v2.5."  # starting at 760 from v2.4
-    model_id = "v2.6."  # start from scratch
-    model_id = "v2.7."  # starting at 160 from v2.4
-    model_id = "v2.8."  # starting at 420 from v2.4
-    
-    model_id = "v2."
-    n_start = 596
+
     ############################
 
     # Batch size: 2048 uses ~7.5 GB (of 16 GB available on T4).
@@ -1217,13 +1211,9 @@ def train_network(data_prefix, model_dir):
     #batch_size = 2048
     #lr = 0.004 # 2x twice of lr for batch size = 1024
     
+    # These will change during training. See get_meta_parameters()
     batch_size = 1024
     lr = 0.001 
-    #lr = 0.0003 # starting at 685
-    
-    #batch_size = 512 #starting at 760
-    #lr = 0.001 # 
-    #lr = 0.0005 # starting at 760
 
     n_epochs = 2000
     n_windup = 200
@@ -1436,10 +1426,10 @@ if __name__ == "__main__":
             data_prefix = "/srv/data/CAMS/processed_data/"  
         else:
             print(f"Unknown argument {sys.argv[1]}")
-            print("Usage: python train_network_fast_T4.py [azure|google]")
+            print("Usage: python train_network_fast_T4.py [azure | google | local]")
             quit()
     else:
-        print("Usage: python train_network_fast_T4.py [azure|google]")
+        print("Usage: python train_network_fast_T4.py [azure | google | local]")
         quit()
 
     train_network(model_dir=model_dir, data_prefix=data_prefix)
