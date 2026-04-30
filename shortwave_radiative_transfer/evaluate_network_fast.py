@@ -833,10 +833,6 @@ def evaluate_network_analysis(base_prefix, data_prefix):
     if tn.__name__ == 'train_network':
         model_id = "v2."
         n_epoch = 596
-        model_id = "v2.8."
-        n_epoch = 896
-        model_id = "v2.5."
-        n_epoch = 930
         n_channel = 42
     elif tn.__name__ == 'train_network_5':
         model_id = "v5.1."      # 28 channels instead of 42 
@@ -910,7 +906,8 @@ def evaluate_network_analysis(base_prefix, data_prefix):
             loss_flux_0_05 = nl.mu_selector_flux_maker(0.05, nl.total_rmse)
             loss_flux_0_10 = nl.mu_selector_flux_maker(0.10, nl.total_rmse)
 
-            loss_functions_full = (
+
+            loss_functions = (
                 nl.openbox_rmse,
                 nl.flux_rmse, nl.heating_rate_rmse,
                 nl.direct_flux_rmse, nl.diffuse_flux_rmse,
@@ -921,7 +918,7 @@ def evaluate_network_analysis(base_prefix, data_prefix):
                 nl.heating_rate_bias,
                 loss_flux_0_01, loss_flux_0_05, loss_flux_0_10)
 
-            loss_names_full = (
+            loss_names = (
                 "Openbox RMSE",
                 "Flux RMSE", "Heating Rate RMSE",
                 "Direct Flux RMSE", "Diffuse Flux RMSE",
@@ -932,12 +929,13 @@ def evaluate_network_analysis(base_prefix, data_prefix):
                 "Heating Rate Bias",
                 "RMSE_flux_0_01", "RMSE_flux_0_05", "RMSE_flux_0_10")
             
-            loss_functions = (
-                nl.flux_rmse, nl.heating_rate_rmse)
+            if False:
+                loss_functions = (
+                    nl.flux_rmse, nl.heating_rate_rmse)
 
-            loss_names = (
-                "Flux RMSE", "Heating Rate RMSE")
-
+                loss_names = (
+                    "Flux RMSE", "Heating Rate RMSE")
+            
             torch.cuda.synchronize()
             t_0 = time.time()
             _, _ = test_loop_fast(test_dataloader, model,
@@ -980,6 +978,9 @@ if __name__ == "__main__":
         elif sys.argv[1] == "google":
             base_prefix = "/home/henry/src/openbox_dev/"
             data_prefix = "/mnt/disks/data-t1/atmospheric_data/CAMS/processed_data/"
+        elif sys.argv[1] == "local":
+            base_prefix = "/home/henry/src/openbox_neural_networks/"
+            data_prefix = "/srv/data/CAMS/processed_data/"  
         else:
             print(f"Unknown argument {sys.argv[1]}")
             print(f"Usage: python evaluate_network.py [azure|google]")
