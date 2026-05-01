@@ -3,7 +3,7 @@
 Author - Henry Schneiderman, henry@pittdata.com<br>
 Please contact me for any questions or feedback
 
-H. Schneiderman. "An Open Box Physics-Based Neural Network for Modeling Shortwave Radiative Transfer." To appear in *Artificial Intelligence for the Earth Systems* (AIES)
+Schneiderman, H., 2025: An Open-Box Physics-Based Neural Network for Modeling Shortwave Radiative Transfer. Artif. Intell. Earth Syst., 5, 240099, https://doi.org/10.1175/AIES-D-24-0099.1.
 
 ---
 Conda environment setup (installs all required Python packages):</br> conda create -n myenv –file package_list.txt
@@ -12,8 +12,10 @@ Training and testing datasets available at https://zenodo.org/records/15089913
 
 ---
 evaluate_network.py - For testing and analyzing trained networks listed below<br>
+evaluate_network_fast.py - Accelerated version of evaluate_network.py. 15X speed-up on NVDIA T4 (Turing Architecture) GPU. Uses customized Triton kernels.
 
 train_network.py - "Baseline" neural network described in Sections 4.b - 4.f<br>
+train_network_fast.py - Accelerated version of train_network.py. 7X speed-up on NVDIA T4 (Turing Architecture) GPU. Uses customized Triton kernels.
 
 train_network_3.py - Modified network allowing all atmospheric constituents to influence all spectral channels as described in Section 4.i. <br>
 
@@ -26,6 +28,8 @@ train_network_7.py - Modified neural network that replaces the transmissivity an
 data_generation.py - Fetches and preprocesses data. Used by training and evaluation<br>
 
 network_losses.py - Loss functions for training and evaluation (e.g., loss as a function of atmospheric layer, geographic location, cosine of solar zenith angle, clear sky vs. full sky)<br>
+
+fused_scattering_T4.py, fused_scattering_training_T4.py, multiple_mlps.py, fused_propagation.py, fused_multireflection_propagation.py - GPU optimized computations for various components (scattering, multireflection, etc.) used by evaluate_network_fast.py and train_network_fast.py. See comments in those files.
 
 models/ - Trained model weights <br>
 
