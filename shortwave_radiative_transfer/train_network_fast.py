@@ -62,7 +62,7 @@ if 'CC' not in os.environ:
             os.environ['CC'] = _cc
             break
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('highest')
 
 default_float_type = torch.float32
 
